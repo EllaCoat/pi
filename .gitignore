@@ -64,14 +64,7 @@ packages/agent/docs/extensions/pi-server-artifact/index.md
 /screenshots/
 /recordings/
 /exports/
-*.local.json
-*.local.yml
-*.local.yaml
-*.local.toml
-*.local.ts
-*.local.js
-*.local.mjs
-*.local.cjs
+*.local.*
 .env.*
 !.env.example
 !.env.sample
