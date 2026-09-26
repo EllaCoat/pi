@@ -194,6 +194,24 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain("Use bash to load a skill's file");
 		});
 
+		test("keeps readable skills while hiding host tool descriptions", () => {
+			const selectedTools = ["read", "eval"];
+			const prompt = buildSystemPrompt({
+				selectedTools,
+				modelVisibleTools: ["eval"],
+				skills: [testSkill],
+				cwd: process.cwd(),
+				toolSnippets: { read: "HIDDEN_READ_SNIPPET", eval: "Execute code" },
+				toolGuidelines: { read: ["HIDDEN_READ_GUIDELINE"] },
+			});
+			expect(prompt).toContain("<name>test-skill</name>");
+			expect(prompt).toContain("/skills/test-skill/SKILL.md");
+			expect(prompt).toContain("Execute code");
+			expect(prompt).not.toContain("HIDDEN_READ_SNIPPET");
+			expect(prompt).not.toContain("HIDDEN_READ_GUIDELINE");
+			expect(selectedTools).toEqual(["read", "eval"]);
+		});
+
 		test("omits skills without read or bash", () => {
 			const prompt = buildSystemPrompt({
 				selectedTools: ["write"],

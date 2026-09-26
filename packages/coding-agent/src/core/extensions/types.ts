@@ -9,15 +9,18 @@
  */
 
 import type {
+	AgentContext,
 	AgentMessage,
 	AgentToolResult,
 	AgentToolUpdateCallback,
+	ModelVisibleToolSelection,
 	ThinkingLevel,
 	ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
 import type {
 	AnyModel,
 	Api,
+	AssistantMessage,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	ClassifierApi,
@@ -316,6 +319,18 @@ export interface CompactOptions {
  */
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
+/** Result returned by ExtensionAPI.executeTool() and ExtensionContext.executeTool(). */
+export interface ExtensionToolResult extends AgentToolResult<unknown> {
+	isError: boolean;
+	toolCallId: string;
+}
+/** Per-call identity supplied when an extension dispatches a tool for another agent. */
+export interface ExtensionToolExecutionOptions {
+	signal?: AbortSignal;
+	context?: AgentContext;
+	assistantMessage?: AssistantMessage;
+}
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -356,6 +371,8 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+	/** Execute a currently active host tool without adding its call or result to session history. */
+	executeTool(name: string, input: unknown, options?: ExtensionToolExecutionOptions): Promise<ExtensionToolResult>;
 }
 
 /**
@@ -578,6 +595,10 @@ export interface SessionStartEvent {
 	/** Previously active session file. Present for "new", "resume", and "fork". */
 	previousSessionFile?: string;
 }
+/** Fired when this session receives an explicit abort request, before waiting for idle. */
+export interface SessionAbortEvent {
+	type: "session_abort";
+}
 
 /** Fired when the current session metadata changes. */
 export interface SessionInfoChangedEvent {
@@ -680,6 +701,7 @@ export interface SessionTreeEvent {
 
 export type SessionEvent =
 	| SessionStartEvent
+	| SessionAbortEvent
 	| SessionInfoChangedEvent
 	| SessionBeforeSwitchEvent
 	| SessionBeforeForkEvent
@@ -753,6 +775,8 @@ export interface BeforeAgentStartEvent {
 	type: "before_agent_start";
 	/** The raw user prompt text (after expansion). */
 	prompt: string;
+	/** Input text after input handlers, before skill or prompt-template expansion. */
+	inputText?: string;
 	/** Images attached to the user prompt, if any. */
 	images?: ImageContent[];
 	/** The current system prompt, rendered from systemPromptOptions and earlier handler changes. */
@@ -890,6 +914,14 @@ export interface MessageUpdateEvent {
 /** Fired when a message ends */
 export interface MessageEndEvent {
 	type: "message_end";
+	message: AgentMessage;
+}
+
+/** Fired after message_end handlers have run and the message has been saved to the session. */
+export interface MessagePersistedEvent {
+	type: "message_persisted";
+	/** ID of the exact session entry created for this message. */
+	entryId: string;
 	message: AgentMessage;
 }
 
@@ -1205,6 +1237,7 @@ export type ExtensionEvent =
 	| MessageStartEvent
 	| MessageUpdateEvent
 	| MessageEndEvent
+	| MessagePersistedEvent
 	| ToolExecutionStartEvent
 	| ToolExecutionUpdateEvent
 	| ToolExecutionEndEvent
@@ -1373,6 +1406,7 @@ export interface ExtensionAPI {
 		handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>,
 	): () => void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): () => void;
+	on(event: "session_abort", handler: ExtensionHandler<SessionAbortEvent>): () => void;
 	on(event: "session_info_changed", handler: ExtensionHandler<SessionInfoChangedEvent>): () => void;
 	on(
 		event: "session_before_switch",
@@ -1425,6 +1459,7 @@ export interface ExtensionAPI {
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): () => void;
 	on(event: "message_update", handler: ExtensionHandler<MessageUpdateEvent>): () => void;
 	on(event: "message_end", handler: ExtensionHandler<MessageEndEvent, MessageEndEventResult>): () => void;
+	on(event: "message_persisted", handler: ExtensionHandler<MessagePersistedEvent>): () => void;
 	on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): () => void;
 	on(event: "tool_execution_update", handler: ExtensionHandler<ToolExecutionUpdateEvent>): () => void;
 	on(event: "tool_execution_end", handler: ExtensionHandler<ToolExecutionEndEvent>): () => void;
@@ -1530,6 +1565,8 @@ export interface ExtensionAPI {
 
 	/** Execute a shell command. */
 	exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
+	/** Execute a currently active host tool through its normal validation and tool hooks. */
+	executeTool(name: string, input: unknown, options?: ExtensionToolExecutionOptions): Promise<ExtensionToolResult>;
 
 	/** Get the list of currently active tool names. */
 	getActiveTools(): string[];
@@ -1539,6 +1576,10 @@ export interface ExtensionAPI {
 
 	/** Set the active tools by name. */
 	setActiveTools(toolNames: string[]): void;
+	/** Set the tool names exposed to the model without changing which tools remain executable. */
+	setModelVisibleTools(selection: ModelVisibleToolSelection): void;
+	/** Get the configured model-visible tool names; undefined means all active tools. */
+	getModelVisibleTools(): string[] | undefined;
 
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
@@ -1825,6 +1866,8 @@ export type GetAllToolsHandler = () => ToolInfo[];
 export type GetCommandsHandler = () => SlashCommandInfo[];
 
 export type SetActiveToolsHandler = (toolNames: string[]) => void;
+export type GetModelVisibleToolsHandler = (activeToolNames?: readonly string[]) => string[] | undefined;
+export type SetModelVisibleToolsHandler = (selection: ModelVisibleToolSelection) => void;
 
 export type RefreshToolsHandler = () => void;
 
@@ -1841,11 +1884,14 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  * Contains flag values (defaults set during registration, CLI values set after).
  */
 export interface ExtensionRuntimeState {
+	pendingModelVisibleTools?: { selection: ModelVisibleToolSelection };
 	flagValues: Map<string, boolean | string>;
 	/** Legacy provider-config registrations queued during extension loading, processed when runner binds. */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;
 	/** Native pi-ai provider registrations queued during extension loading, processed when runner binds. */
 	pendingNativeProviderRegistrations: Array<{ provider: Provider; extensionPath: string }>;
+	getModelVisibleTools: GetModelVisibleToolsHandler;
+	setModelVisibleTools: SetModelVisibleToolsHandler;
 	/** Throws when this extension instance is stale after runtime replacement. */
 	assertActive: () => void;
 	/** Marks this extension instance as stale after runtime replacement or reload. */
@@ -1876,7 +1922,10 @@ export interface ExtensionActions {
 	setLabel: SetLabelHandler;
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
+	executeTool: (name: string, input: unknown, options?: ExtensionToolExecutionOptions) => Promise<ExtensionToolResult>;
 	setActiveTools: SetActiveToolsHandler;
+	setModelVisibleTools?: SetModelVisibleToolsHandler;
+	getModelVisibleTools?: GetModelVisibleToolsHandler;
 	refreshTools: RefreshToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
@@ -1933,7 +1982,9 @@ export interface ExtensionCommandContextActions {
  * Full runtime = state + actions.
  * Created by loader with throwing action stubs, completed by runner.initialize().
  */
-export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
+export interface ExtensionRuntime
+	extends ExtensionRuntimeState,
+		Omit<ExtensionActions, "getModelVisibleTools" | "setModelVisibleTools"> {}
 
 /** Loaded extension with all registered items. */
 export interface Extension {

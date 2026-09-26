@@ -416,8 +416,16 @@ export class ExtensionRunner {
 		this.runtime.getSessionName = actions.getSessionName;
 		this.runtime.setLabel = actions.setLabel;
 		this.runtime.getActiveTools = actions.getActiveTools;
+		this.runtime.executeTool = actions.executeTool;
 		this.runtime.getAllTools = actions.getAllTools;
 		this.runtime.setActiveTools = actions.setActiveTools;
+		this.runtime.setModelVisibleTools = actions.setModelVisibleTools ?? this.runtime.setModelVisibleTools;
+		this.runtime.getModelVisibleTools = actions.getModelVisibleTools ?? (() => undefined);
+		if (this.runtime.pendingModelVisibleTools && actions.setModelVisibleTools) {
+			const { selection } = this.runtime.pendingModelVisibleTools;
+			this.runtime.pendingModelVisibleTools = undefined;
+			actions.setModelVisibleTools(selection);
+		}
 		this.runtime.refreshTools = actions.refreshTools;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
@@ -883,6 +891,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
 			},
+			executeTool: (name, input, options) => {
+				runner.assertActive();
+				return runner.runtime.executeTool(name, input, options);
+			},
 		};
 	}
 
@@ -1313,9 +1325,35 @@ export class ExtensionRunner {
 		prompt: string,
 		images: ImageContent[] | undefined,
 		systemPromptOptions: BuildSystemPromptOptions,
+		inputText?: string,
 	): Promise<BeforeAgentStartCombinedResult> {
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
-		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
+		let lastSelectedTools = currentOptions.selectedTools.slice();
+		let lastActiveTools = this.runtime.getActiveTools();
+		let explicitToolSelection = false;
+		const syncToolSelection = (): void => {
+			if (
+				currentOptions.selectedTools.length !== lastSelectedTools.length ||
+				currentOptions.selectedTools.some((name, index) => name !== lastSelectedTools[index])
+			)
+				explicitToolSelection = true;
+			const activeTools = this.runtime.getActiveTools();
+			if (
+				!explicitToolSelection &&
+				(activeTools.length !== lastActiveTools.length ||
+					activeTools.some((name, index) => name !== lastActiveTools[index]))
+			)
+				currentOptions.selectedTools = activeTools.slice();
+			lastSelectedTools = currentOptions.selectedTools.slice();
+			lastActiveTools = activeTools.slice();
+		};
+		const renderCurrentSystemPrompt = (): string => {
+			syncToolSelection();
+			return buildSystemPrompt({
+				...currentOptions,
+				modelVisibleTools: this.runtime.getModelVisibleTools(currentOptions.selectedTools),
+			});
+		};
 		const ctx = Object.defineProperties(
 			{},
 			Object.getOwnPropertyDescriptors(this.createContext()),
@@ -1333,6 +1371,7 @@ export class ExtensionRunner {
 						type: "before_agent_start",
 						prompt,
 						images,
+						...(inputText === undefined ? {} : { inputText }),
 						get systemPrompt() {
 							return renderCurrentSystemPrompt();
 						},
@@ -1357,9 +1396,11 @@ export class ExtensionRunner {
 						stack,
 					});
 				}
+				syncToolSelection();
 			}
 		}
 
+		syncToolSelection();
 		return { messages, systemPromptOptions: currentOptions };
 	}
 

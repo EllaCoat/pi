@@ -188,6 +188,8 @@ export interface PrepareNextTurnContext extends AgentTurnContext {}
 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
+	/** Names of executable tools declared to the model. Undefined declares every executable tool. */
+	getModelVisibleTools?: () => readonly string[] | undefined;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.

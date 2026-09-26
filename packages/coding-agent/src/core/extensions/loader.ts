@@ -24,6 +24,7 @@ import type {
 	ExtensionAPI,
 	ExtensionFactory,
 	ExtensionRuntime,
+	ExtensionToolExecutionOptions,
 	LoadExtensionsResult,
 	MarkdownTransformer,
 	MessageRenderer,
@@ -170,8 +171,13 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		getSessionName: notInitialized,
 		setLabel: notInitialized,
 		getActiveTools: notInitialized,
+		executeTool: notInitialized,
 		getAllTools: notInitialized,
 		setActiveTools: notInitialized,
+		getModelVisibleTools: notInitialized,
+		setModelVisibleTools: (selection) => {
+			runtime.pendingModelVisibleTools = { selection };
+		},
 		// registerTool() is valid during extension load; refresh is only needed post-bind.
 		refreshTools: () => {},
 		getCommands: notInitialized,
@@ -392,10 +398,24 @@ function createExtensionAPI(
 			assertActive();
 			return runtime.getAllTools();
 		},
+		executeTool(name: string, input: unknown, options?: ExtensionToolExecutionOptions) {
+			assertActive();
+			return runtime.executeTool(name, input, options);
+		},
 
 		setActiveTools(toolNames: string[]): void {
 			assertActive();
 			runtime.setActiveTools(toolNames);
+		},
+
+		getModelVisibleTools(): string[] | undefined {
+			assertActive();
+			return runtime.getModelVisibleTools();
+		},
+
+		setModelVisibleTools(selection: Parameters<ExtensionAPI["setModelVisibleTools"]>[0]): void {
+			assertActive();
+			applyRuntimeChange(() => runtime.setModelVisibleTools(selection));
 		},
 
 		getCommands() {

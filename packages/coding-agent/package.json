@@ -16,6 +16,10 @@
 			"types": "./dist/index.d.ts",
 			"import": "./dist/index.js"
 		},
+		"./personal-harness": {
+			"types": "./dist/personal-harness/index.d.ts",
+			"import": "./dist/personal-harness/index.js"
+		},
 		"./rpc-entry": {
 			"import": "./dist/bundle/rpc-entry.js"
 		},
@@ -53,6 +57,7 @@
 		"@earendil-works/pi-agent-core": "^0.87.1",
 		"@earendil-works/pi-ai": "^0.87.1",
 		"@earendil-works/pi-tui": "^0.87.1",
+		"@modelcontextprotocol/sdk": "1.25.2",
 		"@silvia-odwyer/photon-node": "0.3.4",
 		"chalk": "6.0.0",
 		"cross-spawn": "7.0.6",

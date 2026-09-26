@@ -11,8 +11,10 @@ export interface BuildSystemPromptOptions {
 	customPrompt?: string;
 	/** Exact full prompt replacement set by a before_agent_start handler. */
 	forceSystemPrompt?: string;
-	/** Tools to include in prompt. Default: [read, bash, edit, write]. */
+	/** Executable tools. Default: [read, bash, edit, write]. */
 	selectedTools?: string[];
+	/** Narrow tool descriptions without removing access to resources through a host bridge. */
+	modelVisibleTools?: readonly string[];
 	/** Optional one-line tool snippets keyed by tool name. */
 	toolSnippets?: Record<string, string>;
 	/** Guideline bullets contributed by each tool, keyed by tool name. */
@@ -56,6 +58,7 @@ export function normalizeBuildSystemPromptOptions(input: BuildSystemPromptOption
 		customPrompt: input.customPrompt,
 		forceSystemPrompt: input.forceSystemPrompt,
 		selectedTools: [...(input.selectedTools ?? ["read", "bash", "edit", "write"])],
+		modelVisibleTools: input.modelVisibleTools === undefined ? undefined : [...input.modelVisibleTools],
 		toolSnippets: { ...(input.toolSnippets ?? {}) },
 		toolGuidelines: Object.fromEntries(
 			Object.entries(input.toolGuidelines ?? {}).map(([name, guidelines]) => [name, [...guidelines]]),
@@ -139,17 +142,20 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 		}
 	}
 
+	const promptTools = selectedTools.filter(
+		(name) => options.modelVisibleTools === undefined || options.modelVisibleTools.includes(name),
+	);
 	const promptSections: Record<string, string> = {};
 	if (customPrompt) {
 		promptSections.preamble = customPrompt;
 	} else {
 		promptSections.preamble =
 			"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
-		const visibleTools = selectedTools.filter((name) => !!toolSnippets[name]);
+		const visibleTools = promptTools.filter((name) => !!toolSnippets[name]);
 		const tools =
 			visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n") : "(none)";
 		promptSections.tools = `${tools}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.`;
-		promptSections.rules = buildRules(selectedTools, toolGuidelines, promptGuidelines);
+		promptSections.rules = buildRules(promptTools, toolGuidelines, promptGuidelines);
 		promptSections.docs = `Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):
 - Main documentation: ${getReadmePath()}
 - Additional docs: ${getDocsPath()}

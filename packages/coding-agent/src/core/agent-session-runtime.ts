@@ -9,7 +9,6 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "./extensions/index.ts";
-import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import { SessionManager } from "./session-manager.ts";
@@ -165,16 +164,12 @@ export class AgentSessionRuntime {
 	}
 
 	private async teardownCurrent(reason: SessionShutdownEvent["reason"], targetSessionFile?: string): Promise<void> {
-		// Settle any active response first so the aborted turn (including tool
-		// results) is persisted to the outgoing session before it is replaced.
-		await this.session.abort();
-		await emitSessionShutdownEvent(this.session.extensionRunner, {
-			type: "session_shutdown",
+		// Session disposal settles the outgoing turn, emits shutdown, then invalidates its context.
+		await this.session.dispose({
 			reason,
 			targetSessionFile,
+			beforeInvalidate: this.beforeSessionInvalidate,
 		});
-		this.beforeSessionInvalidate?.();
-		this.session.dispose();
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
@@ -402,12 +397,10 @@ export class AgentSessionRuntime {
 	}
 
 	async dispose(): Promise<void> {
-		await emitSessionShutdownEvent(this.session.extensionRunner, {
-			type: "session_shutdown",
+		await this.session.dispose({
 			reason: "quit",
+			beforeInvalidate: this.beforeSessionInvalidate,
 		});
-		this.beforeSessionInvalidate?.();
-		this.session.dispose();
 	}
 }
 

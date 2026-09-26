@@ -2180,6 +2180,7 @@ export class InteractiveMode {
 				})();
 			},
 			getSystemPrompt: () => this.session.systemPrompt,
+			executeTool: (name, input, options) => extensionRunner.createContext().executeTool(name, input, options),
 		});
 
 		// Set up the extension shortcut handler on the default editor

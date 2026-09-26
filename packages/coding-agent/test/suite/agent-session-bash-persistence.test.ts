@@ -224,8 +224,10 @@ describe("AgentSession bash and persistence characterization", () => {
 
 		const entries = harness.sessionManager.getEntries();
 		// The prompt is declared by the first request, after the queued custom message.
+		expect(entries[1]).toMatchObject({ type: "custom", customType: "active_tool_loadout_v1", data: ["echo"] });
 		expect(entries.map((entry) => entry.type)).toEqual([
 			"custom_message",
+			"custom",
 			"message",
 			"message",
 			"message",
