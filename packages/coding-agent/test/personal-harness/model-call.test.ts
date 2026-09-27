@@ -10,7 +10,7 @@ import {
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ModelRegistry } from "../../src/core/model-registry.ts";
-import { completeHarnessTask, LUNA_HIGH_FAST, LUNA_MAX } from "../../src/personal-harness/model-call.ts";
+import { completeHarnessTask, LUNA_HIGH_FAST, LUNA_MAX, SOL_HIGH_FAST } from "../../src/personal-harness/model-call.ts";
 import { HarnessUsageLedger } from "../../src/personal-harness/usage.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -24,11 +24,11 @@ afterEach(() => {
 	tempAgentDir = undefined;
 });
 
-function fixture(api: Api = "openai-codex-responses") {
+function fixture(api: Api = "openai-codex-responses", modelId = "gpt-6-luna") {
 	const model = {
 		api,
 		provider: "openai-codex",
-		id: "gpt-6-luna",
+		id: modelId,
 		reasoning: true,
 		thinkingLevelMap: { max: "max" },
 	} as Model<Api>;
@@ -66,6 +66,28 @@ describe("personal harness model calls", () => {
 		);
 		expect(f.streamSimple).not.toHaveBeenCalled();
 		expect(ledger.snapshot().memory).toMatchObject({ calls: 1, failed: 0 });
+	});
+
+	it("uses Sol/high and Codex Fast Mode through the typed priority stream options", async () => {
+		const f = fixture("openai-codex-responses", "gpt-6-sol");
+		const ledger = new HarnessUsageLedger();
+
+		await completeHarnessTask({
+			registry: f.registry,
+			selection: SOL_HIGH_FAST,
+			purpose: "compact",
+			context,
+			ledger,
+		});
+
+		expect(f.registry.find).toHaveBeenCalledWith("openai-codex", "gpt-6-sol");
+		expect(f.stream).toHaveBeenCalledWith(
+			f.model,
+			context,
+			expect.objectContaining({ reasoningEffort: "high", serviceTier: "priority", maxTokens: 8192 }),
+		);
+		expect(f.streamSimple).not.toHaveBeenCalled();
+		expect(ledger.snapshot().compact).toMatchObject({ calls: 1, failed: 0 });
 	});
 
 	it("keeps Luna/max non-Fast requests on the provider-neutral simple stream", async () => {

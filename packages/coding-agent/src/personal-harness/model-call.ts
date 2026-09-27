@@ -19,6 +19,13 @@ export const LUNA_HIGH_FAST: HarnessModelSelection = {
 	fast: true,
 };
 
+export const SOL_HIGH_FAST: HarnessModelSelection = {
+	provider: "openai-codex",
+	model: "gpt-6-sol",
+	thinking: "high",
+	fast: true,
+};
+
 export interface HarnessCompletionOptions {
 	registry: ModelRegistry;
 	selection: HarnessModelSelection;
