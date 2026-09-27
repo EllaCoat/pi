@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import type { MemoryTurnEntry, MemoryTurnReadResult, TranscriptSnapshot, TranscriptSyncStats } from "./transcript.ts";
 
 export type MemoryRole = "user" | "assistant" | "tool";
 export type MemoryOutcome = "completed" | "failed" | "unverified";
@@ -69,6 +70,10 @@ export interface MemoryIndexResult {
 	readonly redacted: number;
 	readonly generation: number;
 }
+export interface MemoryTranscriptRebuildResult {
+	readonly transcript: TranscriptSyncStats;
+	readonly index: MemoryIndexResult;
+}
 
 export interface MemoryReadResult {
 	readonly status: "ready" | "not-found" | "stale" | "excluded";
@@ -112,6 +117,29 @@ interface SourceRow {
 	readonly outcome: MemoryOutcome;
 	readonly content: string;
 	readonly timestamp: string | null;
+	readonly redacted: number;
+}
+interface TranscriptEntryRow {
+	readonly entry_id: string;
+	readonly seq: number;
+	readonly parent_entry_id: string | null;
+	readonly user_turn_id: string | null;
+	readonly entry_type: string;
+}
+interface StoredTranscriptEntryRow extends TranscriptEntryRow {
+	readonly raw_json: string;
+}
+
+interface TranscriptSourceRow {
+	readonly source_revision: string;
+	readonly role: MemoryRole;
+	readonly content: string;
+	readonly redacted: number;
+}
+
+interface TranscriptDirectiveRow {
+	readonly action: "exclude" | "correct" | "include";
+	readonly correction: string | null;
 	readonly redacted: number;
 }
 
@@ -196,6 +224,23 @@ const SCHEMA = `
 		UNIQUE (session_id, entry_id)
 	) STRICT;
 	CREATE VIRTUAL TABLE IF NOT EXISTS memory_directive_fts USING fts5(searchable, tokenize='unicode61 remove_diacritics 2');
+	CREATE TABLE IF NOT EXISTS memory_transcript_headers (
+		session_id TEXT PRIMARY KEY,
+		raw_json TEXT NOT NULL,
+		processed_byte_offset INTEGER NOT NULL CHECK (processed_byte_offset >= 0)
+	) STRICT;
+	CREATE TABLE IF NOT EXISTS memory_transcript_entries (
+		session_id TEXT NOT NULL REFERENCES memory_transcript_headers(session_id) ON DELETE CASCADE,
+		entry_id TEXT NOT NULL,
+		seq INTEGER NOT NULL CHECK (seq >= 0),
+		parent_entry_id TEXT,
+		user_turn_id TEXT,
+		entry_type TEXT NOT NULL,
+		raw_json TEXT NOT NULL,
+		PRIMARY KEY (session_id, entry_id)
+	) STRICT;
+	CREATE INDEX IF NOT EXISTS memory_transcript_turns
+		ON memory_transcript_entries (session_id, user_turn_id, seq);
 `;
 
 const MAX_QUERY_CHARACTERS = 512;
@@ -448,49 +493,55 @@ export class MemoryIndex {
 
 	rebuild(records: readonly MemorySourceRecord[]): MemoryIndexResult {
 		this.#assertOpen();
-		let inserted = 0;
-		let updated = 0;
-		let skipped = 0;
-		let redacted = 0;
 		this.#database.exec("BEGIN IMMEDIATE;");
+		let counts: Omit<MemoryIndexResult, "generation">;
 		try {
-			this.#database.exec(`
-				CREATE TEMP TABLE IF NOT EXISTS memory_rebuild_origins (
-					session_id TEXT NOT NULL,
-					entry_id TEXT NOT NULL,
-					branch_id TEXT NOT NULL,
-					PRIMARY KEY (session_id, entry_id)
-				) STRICT;
-				DELETE FROM temp.memory_rebuild_origins;
-				INSERT INTO temp.memory_rebuild_origins (session_id, entry_id, branch_id)
-					SELECT session_id, entry_id, branch_id FROM memory_sources;
-				DELETE FROM memory_source_fts;
-				DELETE FROM memory_sources;
-			`);
-			const previousOrigin = this.#database.prepare(
-				"SELECT branch_id FROM temp.memory_rebuild_origins WHERE session_id = ? AND entry_id = ?",
-			);
-			for (const record of records) {
-				if (record.origin === "derived-recall") {
-					skipped++;
-					continue;
-				}
-				const origin = previousOrigin.get(record.sessionId, record.entryId) as
-					| { readonly branch_id: string }
-					| undefined;
-				const indexed = this.#indexRecord(record, origin?.branch_id ?? record.branchId);
-				if (indexed.action === "inserted") inserted++;
-				else if (indexed.action === "updated") updated++;
-				else skipped++;
-				if (indexed.redacted) redacted++;
-			}
-			this.#bumpGeneration();
+			counts = this.#rebuildSearchIndex(undefined, records);
 			this.#database.exec("COMMIT;");
 		} catch (error) {
 			this.#rollback();
 			throw error;
 		}
-		return { inserted, updated, skipped, redacted, generation: this.#readGeneration() };
+		return { ...counts, generation: this.#readGeneration() };
+	}
+
+	syncTranscript(snapshot: TranscriptSnapshot): TranscriptSyncStats {
+		this.#assertOpen();
+		this.#database.exec("BEGIN IMMEDIATE;");
+		try {
+			const result = this.#syncTranscriptSnapshot(snapshot);
+			this.#database.exec("COMMIT;");
+			return result;
+		} catch (error) {
+			this.#rollback();
+			throw error;
+		}
+	}
+
+	rebuildFromTranscript(
+		snapshot: TranscriptSnapshot,
+		records: readonly MemorySourceRecord[],
+	): MemoryTranscriptRebuildResult {
+		this.#assertOpen();
+		for (const record of records) {
+			if (record.sessionId !== snapshot.sessionId)
+				throw new TypeError("Transcript rebuild records must belong to the transcript session");
+		}
+		this.#database.exec("BEGIN IMMEDIATE;");
+		let transcript: TranscriptSyncStats;
+		let counts: Omit<MemoryIndexResult, "generation">;
+		try {
+			transcript = this.#syncTranscriptSnapshot(snapshot);
+			counts = this.#rebuildSearchIndex(snapshot.sessionId, records);
+			this.#database.exec("COMMIT;");
+		} catch (error) {
+			this.#rollback();
+			throw error;
+		}
+		return {
+			transcript,
+			index: { ...counts, generation: this.#readGeneration() },
+		};
 	}
 
 	search(query: string, scope: MemoryScope = {}): MemorySearchResult {
@@ -657,6 +708,91 @@ export class MemoryIndex {
 		};
 	}
 
+	readTurn(sessionId: string, userTurnId: string, leafEntryId: string): MemoryTurnReadResult {
+		this.#assertOpen();
+		validateSafeText(sessionId, "session ID", 128);
+		validateSafeText(userTurnId, "user turn ID", 128);
+		validateSafeText(leafEntryId, "leaf entry ID", 128);
+		const notFound: MemoryTurnReadResult = { status: "not-found", sessionId, userTurnId, leafEntryId, entries: [] };
+		const reversePath: TranscriptEntryRow[] = [];
+		const visited = new Set<string>();
+		let current = this.#readTranscriptEntry(sessionId, leafEntryId);
+		let reachedTurn = false;
+		while (current && !visited.has(current.entry_id)) {
+			visited.add(current.entry_id);
+			reversePath.push(current);
+			if (current.entry_id === userTurnId) {
+				reachedTurn = current.user_turn_id === userTurnId && current.entry_type === "message";
+				break;
+			}
+			current =
+				current.parent_entry_id === null
+					? undefined
+					: this.#readTranscriptEntry(sessionId, current.parent_entry_id);
+		}
+		if (!reachedTurn) return notFound;
+
+		const entries: MemoryTurnEntry[] = [];
+		for (const entry of reversePath.reverse()) {
+			if (entry.entry_id !== userTurnId && entry.user_turn_id !== userTurnId) break;
+			const base = {
+				entryId: entry.entry_id,
+				seq: entry.seq,
+				parentEntryId: entry.parent_entry_id,
+				...(entry.user_turn_id !== null ? { userTurnId: entry.user_turn_id } : {}),
+				entryType: entry.entry_type,
+			};
+			const source = this.#database
+				.prepare(
+					"SELECT source_revision, role, content, redacted FROM memory_sources WHERE session_id = ? AND entry_id = ?",
+				)
+				.get(sessionId, entry.entry_id) as TranscriptSourceRow | undefined;
+			const directive = this.#database
+				.prepare("SELECT action, correction, redacted FROM memory_directives WHERE session_id = ? AND entry_id = ?")
+				.get(sessionId, entry.entry_id) as TranscriptDirectiveRow | undefined;
+			if (directive?.action === "exclude") {
+				entries.push({ ...base, contentStatus: "excluded" });
+				continue;
+			}
+			if (directive?.action === "correct") {
+				if (directive.correction === null) {
+					entries.push({ ...base, contentStatus: "excluded" });
+					continue;
+				}
+				const content = directive.correction;
+				const end = Math.min(content.length, MAX_READ_CHARACTERS);
+				const safeEnd = end < content.length && /[\uD800-\uDBFF]/u.test(content[end - 1] ?? "") ? end - 1 : end;
+				entries.push({
+					...base,
+					contentStatus: "corrected",
+					...(source ? { role: source.role } : {}),
+					content: content.slice(0, safeEnd),
+					redacted: directive.redacted === 1,
+					totalCharacters: content.length,
+					omittedAfterCharacters: content.length - safeEnd,
+				});
+				continue;
+			}
+			if (!source) {
+				entries.push({ ...base, contentStatus: "not-indexed" });
+				continue;
+			}
+			const end = Math.min(source.content.length, MAX_READ_CHARACTERS);
+			const safeEnd =
+				end < source.content.length && /[\uD800-\uDBFF]/u.test(source.content[end - 1] ?? "") ? end - 1 : end;
+			entries.push({
+				...base,
+				contentStatus: "available",
+				role: source.role,
+				content: source.content.slice(0, safeEnd),
+				redacted: source.redacted === 1,
+				totalCharacters: source.content.length,
+				omittedAfterCharacters: source.content.length - safeEnd,
+			});
+		}
+		return { status: "ready", sessionId, userTurnId, leafEntryId, entries };
+	}
+
 	exclude(reference: MemorySourceRef, reason: string): MemoryDirectiveResult {
 		return this.#setDirective(reference, "exclude", reason, null);
 	}
@@ -675,6 +811,216 @@ export class MemoryIndex {
 
 	close(): void {
 		if (this.#database.isOpen) this.#database.close();
+	}
+
+	#readTranscriptEntry(sessionId: string, entryId: string): TranscriptEntryRow | undefined {
+		return this.#database
+			.prepare(
+				`SELECT entry_id, seq, parent_entry_id, user_turn_id, entry_type
+				FROM memory_transcript_entries WHERE session_id = ? AND entry_id = ?`,
+			)
+			.get(sessionId, entryId) as TranscriptEntryRow | undefined;
+	}
+
+	#syncTranscriptSnapshot(snapshot: TranscriptSnapshot): TranscriptSyncStats {
+		this.#validateTranscriptSnapshot(snapshot);
+		const header = this.#database
+			.prepare("SELECT raw_json FROM memory_transcript_headers WHERE session_id = ?")
+			.get(snapshot.sessionId) as { readonly raw_json: string } | undefined;
+		const previousRows = this.#database
+			.prepare(
+				`SELECT entry_id, seq, parent_entry_id, user_turn_id, entry_type, raw_json
+				FROM memory_transcript_entries WHERE session_id = ?`,
+			)
+			.all(snapshot.sessionId) as unknown as StoredTranscriptEntryRow[];
+		const previousById = new Map(previousRows.map((row) => [row.entry_id, row]));
+		const incomingIds = new Set<string>();
+		let inserted = 0;
+		let updated = 0;
+		let skipped = 0;
+		let deleted = 0;
+		const headerChanged = header === undefined || header.raw_json !== snapshot.headerJson;
+
+		if (header === undefined) {
+			this.#database
+				.prepare(
+					"INSERT INTO memory_transcript_headers (session_id, raw_json, processed_byte_offset) VALUES (?, ?, 0)",
+				)
+				.run(snapshot.sessionId, snapshot.headerJson);
+		} else if (headerChanged) {
+			this.#database
+				.prepare("UPDATE memory_transcript_headers SET raw_json = ? WHERE session_id = ?")
+				.run(snapshot.headerJson, snapshot.sessionId);
+		}
+
+		for (const entry of snapshot.entries) {
+			incomingIds.add(entry.entryId);
+			const previous = previousById.get(entry.entryId);
+			const userTurnId = entry.userTurnId ?? null;
+			if (
+				previous &&
+				previous.seq === entry.seq &&
+				previous.parent_entry_id === entry.parentEntryId &&
+				previous.user_turn_id === userTurnId &&
+				previous.entry_type === entry.entryType &&
+				previous.raw_json === entry.rawJson
+			) {
+				skipped++;
+				continue;
+			}
+			if (previous) {
+				this.#database
+					.prepare(
+						`UPDATE memory_transcript_entries
+						SET seq = ?, parent_entry_id = ?, user_turn_id = ?, entry_type = ?, raw_json = ?
+						WHERE session_id = ? AND entry_id = ?`,
+					)
+					.run(
+						entry.seq,
+						entry.parentEntryId,
+						userTurnId,
+						entry.entryType,
+						entry.rawJson,
+						snapshot.sessionId,
+						entry.entryId,
+					);
+				updated++;
+			} else {
+				this.#database
+					.prepare(
+						`INSERT INTO memory_transcript_entries
+						(session_id, entry_id, seq, parent_entry_id, user_turn_id, entry_type, raw_json)
+						VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					)
+					.run(
+						snapshot.sessionId,
+						entry.entryId,
+						entry.seq,
+						entry.parentEntryId,
+						userTurnId,
+						entry.entryType,
+						entry.rawJson,
+					);
+				inserted++;
+			}
+		}
+
+		for (const entry of previousRows) {
+			if (incomingIds.has(entry.entry_id)) continue;
+			this.#database
+				.prepare("DELETE FROM memory_transcript_entries WHERE session_id = ? AND entry_id = ?")
+				.run(snapshot.sessionId, entry.entry_id);
+			deleted++;
+		}
+		this.#database
+			.prepare("UPDATE memory_transcript_headers SET raw_json = ?, processed_byte_offset = ? WHERE session_id = ?")
+			.run(snapshot.headerJson, snapshot.byteLength, snapshot.sessionId);
+		return {
+			sessionId: snapshot.sessionId,
+			inserted,
+			updated,
+			skipped,
+			deleted,
+			headerChanged,
+			processedByteOffset: snapshot.byteLength,
+		};
+	}
+
+	#validateTranscriptSnapshot(snapshot: TranscriptSnapshot): void {
+		validateSafeText(snapshot.sessionId, "transcript session ID", 128);
+		if (typeof snapshot.headerJson !== "string" || snapshot.headerJson.length === 0) {
+			throw new TypeError("Transcript header JSON must be non-empty text");
+		}
+		if (!Number.isSafeInteger(snapshot.byteLength) || snapshot.byteLength < 0) {
+			throw new TypeError("Transcript byte offset must be a non-negative safe integer");
+		}
+		if (!Array.isArray(snapshot.entries)) throw new TypeError("Transcript entries must be an array");
+		const entryIds = new Set<string>();
+		const sequences = new Set<number>();
+		for (const entry of snapshot.entries) {
+			validateSafeText(entry.entryId, "transcript entry ID", 128);
+			validateSafeText(entry.entryType, "transcript entry type", 128);
+			if (!Number.isSafeInteger(entry.seq) || entry.seq < 0 || sequences.has(entry.seq)) {
+				throw new TypeError("Transcript entry sequence must be unique and non-negative");
+			}
+			sequences.add(entry.seq);
+			if (entryIds.has(entry.entryId)) throw new TypeError("Transcript entry IDs must be unique per session");
+			entryIds.add(entry.entryId);
+			if (entry.parentEntryId !== null) validateSafeText(entry.parentEntryId, "transcript parent entry ID", 128);
+			if (entry.userTurnId !== undefined) validateSafeText(entry.userTurnId, "transcript user turn ID", 128);
+			if (typeof entry.rawJson !== "string" || entry.rawJson.length === 0) {
+				throw new TypeError("Transcript entry JSON must be non-empty text");
+			}
+			if (
+				entry.sessionEntry.id !== entry.entryId ||
+				entry.sessionEntry.type !== entry.entryType ||
+				entry.sessionEntry.parentId !== entry.parentEntryId
+			) {
+				throw new TypeError("Transcript entry metadata does not match its JSONL record");
+			}
+		}
+	}
+
+	#rebuildSearchIndex(
+		sessionId: string | undefined,
+		records: readonly MemorySourceRecord[],
+	): Omit<MemoryIndexResult, "generation"> {
+		let inserted = 0;
+		let updated = 0;
+		let skipped = 0;
+		let redacted = 0;
+		this.#database.exec(`
+			CREATE TEMP TABLE IF NOT EXISTS memory_rebuild_origins (
+				session_id TEXT NOT NULL,
+				entry_id TEXT NOT NULL,
+				branch_id TEXT NOT NULL,
+				PRIMARY KEY (session_id, entry_id)
+			) STRICT;
+			DELETE FROM temp.memory_rebuild_origins;
+		`);
+		if (sessionId === undefined) {
+			this.#database.exec(
+				"INSERT INTO temp.memory_rebuild_origins (session_id, entry_id, branch_id) SELECT session_id, entry_id, branch_id FROM memory_sources",
+			);
+		} else {
+			this.#database
+				.prepare(
+					"INSERT INTO temp.memory_rebuild_origins (session_id, entry_id, branch_id) SELECT session_id, entry_id, branch_id FROM memory_sources WHERE session_id = ?",
+				)
+				.run(sessionId);
+		}
+		if (sessionId === undefined) {
+			this.#database.exec("DELETE FROM memory_source_fts; DELETE FROM memory_sources;");
+		} else {
+			this.#database
+				.prepare(
+					"DELETE FROM memory_source_fts WHERE rowid IN (SELECT id FROM memory_sources WHERE session_id = ?)",
+				)
+				.run(sessionId);
+			this.#database.prepare("DELETE FROM memory_sources WHERE session_id = ?").run(sessionId);
+		}
+		const previousOrigin = this.#database.prepare(
+			"SELECT branch_id FROM temp.memory_rebuild_origins WHERE session_id = ? AND entry_id = ?",
+		);
+		for (const record of records) {
+			if (sessionId !== undefined && record.sessionId !== sessionId) {
+				throw new TypeError("Rebuilt memory records must belong to the selected session");
+			}
+			if (record.origin === "derived-recall") {
+				skipped++;
+				continue;
+			}
+			const origin = previousOrigin.get(record.sessionId, record.entryId) as
+				| { readonly branch_id: string }
+				| undefined;
+			const indexed = this.#indexRecord(record, origin?.branch_id ?? record.branchId);
+			if (indexed.action === "inserted") inserted++;
+			else if (indexed.action === "updated") updated++;
+			else skipped++;
+			if (indexed.redacted) redacted++;
+		}
+		this.#bumpGeneration();
+		return { inserted, updated, skipped, redacted };
 	}
 
 	#validateRecord(record: MemorySourceRecord): void {

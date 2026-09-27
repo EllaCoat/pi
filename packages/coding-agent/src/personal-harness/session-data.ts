@@ -60,8 +60,8 @@ export function memoryRecordsFromBranch(
 	const records: MemorySourceRecord[] = [];
 	for (let ordinal = Math.max(0, startIndex); ordinal < entries.length; ordinal++) {
 		const entry = entries[ordinal];
-		if (entry?.type !== "message") continue;
-		const message = entry.message;
+		if (entry?.type !== "message" || !isRecord(entry.message)) continue;
+		const message = entry.message as unknown as AgentMessage;
 		if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") continue;
 		const content = messageText(message).trim();
 		if (!content) continue;
@@ -89,6 +89,34 @@ export function memoryRecordsFromBranch(
 			timestamp: entry.timestamp,
 			outcome: outcome(message),
 		});
+	}
+	return records;
+}
+
+/** Build search records for every leaf path so a rebuilt index can answer branch-scoped queries. */
+export function memoryRecordsFromAllBranches(
+	entries: readonly SessionEntry[],
+	sessionId: string,
+): MemorySourceRecord[] {
+	const entryById = new Map(entries.map((entry) => [entry.id, entry]));
+	const parentIds = new Set<string>();
+	for (const entry of entries) {
+		if (entry.parentId !== null) parentIds.add(entry.parentId);
+	}
+	const leaves = entries.filter((entry) => !parentIds.has(entry.id));
+	const records: MemorySourceRecord[] = [];
+	for (const leaf of leaves) {
+		const reversePath: SessionEntry[] = [];
+		const visited = new Set<string>();
+		let current: SessionEntry | undefined = leaf;
+		while (current && !visited.has(current.id)) {
+			visited.add(current.id);
+			reversePath.push(current);
+			current = current.parentId === null ? undefined : entryById.get(current.parentId);
+		}
+		const branch = reversePath.reverse();
+		const branchId = branchIdForEntries(entries, branch, sessionId);
+		records.push(...memoryRecordsFromBranch(branch, sessionId, branchId));
 	}
 	return records;
 }

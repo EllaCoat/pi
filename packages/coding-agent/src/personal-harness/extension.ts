@@ -41,6 +41,7 @@ import {
 	LUNA_HIGH_FAST,
 	LUNA_MAX,
 } from "./model-call.ts";
+
 import { branchIdForEntries, latestTodoSnapshot, memoryRecordsFromBranch } from "./session-data.ts";
 import { createPiSubagentSessionFactory } from "./subagent-factory.ts";
 import {
@@ -134,6 +135,8 @@ const MemoryParameters = Type.Object({
 		Type.Literal("search"),
 		Type.Literal("recall"),
 		Type.Literal("read"),
+		Type.Literal("read-turn"),
+		Type.Literal("rebuild-transcript"),
 		Type.Literal("correct"),
 		Type.Literal("exclude"),
 		Type.Literal("include"),
@@ -144,10 +147,13 @@ const MemoryParameters = Type.Object({
 	text: Type.Optional(Type.String()),
 	reason: Type.Optional(Type.String()),
 	sessionId: Type.Optional(Type.String()),
+	userTurnId: Type.Optional(Type.String()),
+	leafEntryId: Type.Optional(Type.String()),
 	branchId: Type.Optional(Type.String()),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 3 })),
 	offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 500 })),
 });
+
 const TodoParameters = Type.Object({
 	action: Type.Union([
 		Type.Literal("list"),
@@ -245,6 +251,7 @@ export interface PersonalHarnessExtensionOptions {
 	/** Paths to skills and private hook values are references supplied by the caller, never embedded in this module. */
 	readonly inheritedSkillPaths?: readonly string[];
 	readonly hookValues?: Omit<Partial<HarnessHookOptions>, "evaluate" | "hold" | "ledger">;
+
 	readonly backgroundTodoModel?: HarnessModelSelection;
 	readonly memoryCuratorModel?: HarnessModelSelection;
 	readonly webSearchModel?: HarnessModelSelection;
@@ -276,8 +283,10 @@ interface ActiveHarnessSession {
 	pendingEntries: DeferredSessionEntry[];
 	pendingChildNotifications: HarnessSubagentResult[];
 	pendingChildMessages: HarnessSubagentMessage[];
-	indexedLength: number;
-	indexedTailId: string | null;
+	todoProcessedLength: number;
+	todoProcessedTailId: string | null;
+	ftsIndexedLength: number;
+	ftsIndexedTailId: string | null;
 }
 
 function toolResult(text: string, isError = false, details?: unknown): AgentToolResult<unknown> {
@@ -661,6 +670,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		const clients: Record<string, HarnessMcpClient> = {};
 		const connecting: Record<string, Promise<HarnessMcpClient>> = {};
 		let memory: PersonalMemoryStore | undefined;
+
 		let currentRegistry: ModelRegistry | undefined;
 		let evaluateHooks: JevEvaluator = async () => {
 			throw new Error("Jev server and tool are not configured");
@@ -823,12 +833,17 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 			}
 		}
 
-		function disposeSessionScope(scope: ActiveHarnessSession): Promise<void> {
-			scope.controller.abort(new Error("Personal harness session scope ended"));
+		function disposeSessionScope(
+			scope: ActiveHarnessSession,
+			mode: "scope-change" | "shutdown" = "scope-change",
+		): Promise<void> {
+			// A scope change may already have moved the manager's leaf; only final shutdown may flush there.
+			if (mode === "scope-change") scope.controller.abort(new Error("Personal harness session scope ended"));
 			scope.pendingEntries = [];
 			scope.pendingChildNotifications = [];
 			scope.pendingChildMessages = [];
 			scope.scheduler.shutdown();
+			if (mode === "shutdown") scope.controller.abort(new Error("Personal harness session scope ended"));
 			const tasks = scope.subagents.close();
 			return Promise.all([codeMode.shutdownSession(scope.scopeKey), tasks]).then(() => undefined);
 		}
@@ -878,7 +893,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 								pendingIds.has(`child-result:${entry.data.id}`)),
 					);
 					const processedLength =
-						firstPending < 0 ? scope.indexedLength : Math.min(scope.indexedLength, firstPending);
+						firstPending < 0 ? scope.todoProcessedLength : Math.min(scope.todoProcessedLength, firstPending);
 					appendBackgroundEntry(scope, TODO_SESSION_ENTRY_TYPE, {
 						...snapshot,
 						processedThroughEntryId: branch[processedLength - 1]?.id ?? null,
@@ -931,8 +946,10 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 				pendingEntries: [],
 				pendingChildNotifications: [],
 				pendingChildMessages: [],
-				indexedLength: processedLength,
-				indexedTailId: branch[processedLength - 1]?.id ?? null,
+				todoProcessedLength: processedLength,
+				todoProcessedTailId: branch[processedLength - 1]?.id ?? null,
+				ftsIndexedLength: 0,
+				ftsIndexedTailId: null,
 			};
 			const previousResults: HarnessSubagentResult[] = [];
 			for (const entry of branch) {
@@ -1023,17 +1040,68 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 			}
 		}
 
+		async function syncPersistedTranscript(context: ExtensionContext, sessionId: string): Promise<void> {
+			try {
+				const store = await ensureMemoryStore();
+				store.syncTranscript(context.sessionManager.getSessionFile(), sessionId);
+			} catch {
+				context.ui.notify("Saved session JSONL could not be mirrored to private memory.", "warning");
+			}
+		}
+
+		async function initializeMemoryTranscript(
+			scope: ActiveHarnessSession,
+			context: ExtensionContext,
+			rebuildAllBranches: boolean,
+		): Promise<void> {
+			const store = await ensureMemoryStore();
+			const manager = context.sessionManager;
+			const branch = manager.getBranch();
+			if (rebuildAllBranches) {
+				try {
+					const result = store.rebuildFromTranscript(manager.getSessionFile(), scope.sessionId);
+					if (result.status === "rebuilt") {
+						scope.ftsIndexedLength = branch.length;
+						scope.ftsIndexedTailId = branch.at(-1)?.id ?? null;
+						return;
+					}
+				} catch {
+					context.ui.notify(
+						"Saved session transcript search rebuild failed; retrying the raw mirror and active branch separately.",
+						"warning",
+					);
+					try {
+						store.syncTranscript(manager.getSessionFile(), scope.sessionId);
+					} catch {
+						context.ui.notify("Saved session JSONL could not be mirrored to private memory.", "warning");
+					}
+				}
+			}
+			try {
+				store.index(memoryRecordsFromBranch(branch, scope.sessionId, scope.branchId));
+				scope.ftsIndexedLength = branch.length;
+				scope.ftsIndexedTailId = branch.at(-1)?.id ?? null;
+			} catch {
+				context.ui.notify(
+					"Session memory could not index the active branch; it will retry on the next session event.",
+					"warning",
+				);
+			}
+		}
+
 		async function ensureActive(context: ExtensionContext): Promise<ActiveHarnessSession> {
 			const sessionId = context.sessionManager.getSessionId();
 			const branch = context.sessionManager.getBranch();
 			const branchId = branchIdForEntries(context.sessionManager.getEntries(), branch, sessionId);
 			if (!active || active.sessionId !== sessionId || active.branchId !== branchId) {
+				const previousSessionId = active?.sessionId;
 				if (active) await disposeSessionScope(active);
-				active = makeActiveSession(context);
-				const store = await ensureMemoryStore();
-				store.index(memoryRecordsFromBranch(branch, sessionId, branchId));
+				const scope = makeActiveSession(context);
+				active = scope;
+				await initializeMemoryTranscript(scope, context, previousSessionId !== sessionId);
 			}
 			currentRegistry = context.modelRegistry;
+			if (!active) throw new Error("Personal harness session could not be initialized");
 			return active;
 		}
 
@@ -1053,6 +1121,26 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 			if (params.action === "recall") {
 				if (!params.query) return toolResult("recall requires query", true);
 				return derivedMemoryResult(await store.recall(params.query, memoryScope, signal));
+			}
+			if (params.action === "rebuild-transcript") {
+				if (params.sessionId && params.sessionId !== scope.sessionId) {
+					return toolResult("Transcript rebuild is limited to the current SessionManager session.", true);
+				}
+				const result = store.rebuildFromTranscript(context.sessionManager.getSessionFile(), scope.sessionId);
+				if (result.status === "rebuilt") {
+					const branch = context.sessionManager.getBranch();
+					scope.ftsIndexedLength = branch.length;
+					scope.ftsIndexedTailId = branch.at(-1)?.id ?? null;
+				}
+				return derivedMemoryResult(result);
+			}
+			if (params.action === "read-turn") {
+				if (!params.userTurnId || !params.leafEntryId) {
+					return toolResult("read-turn requires userTurnId and leafEntryId", true);
+				}
+				return derivedMemoryResult(
+					store.readTurn(params.sessionId ?? scope.sessionId, params.userTurnId, params.leafEntryId),
+				);
 			}
 			if (!params.reference) return toolResult(`${params.action} requires a source reference`, true);
 			if (params.action === "read") {
@@ -1582,14 +1670,20 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 			const scope = await ensureActive(context);
 			if (scope !== previous) scope.scheduler.invalidateForNewRequest();
 		});
-		pi.on("session_abort", async () => {
+		pi.on("session_abort", async (_event, context) => {
 			active?.scheduler.abortCurrentUpdate();
 			await active?.subagents.cancelAll();
+			if (active) await syncPersistedTranscript(context, active.sessionId);
 		});
 		pi.on("session_tree", async (_event, context) => {
 			if (active) await disposeSessionScope(active);
 			active = undefined;
-			await ensureActive(context);
+			const scope = await ensureActive(context);
+			try {
+				await processFinalizedEntries(context);
+			} finally {
+				await syncPersistedTranscript(context, scope.sessionId);
+			}
 		});
 		const processFinalizedEntries = async (
 			context: ExtensionContext,
@@ -1597,7 +1691,6 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		): Promise<void> => {
 			const scope = await ensureActive(context);
 			const branch = context.sessionManager.getBranch();
-			const previousTail = scope.indexedTailId;
 			if (
 				persistedUserEntryId !== undefined &&
 				!branch.some(
@@ -1606,19 +1699,28 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 				)
 			)
 				return;
-			const isSamePrefix = scope.indexedLength === 0 || branch[scope.indexedLength - 1]?.id === previousTail;
-			const startIndex = isSamePrefix ? scope.indexedLength : 0;
-			const records = memoryRecordsFromBranch(branch, scope.sessionId, scope.branchId, startIndex);
+
+			const ftsPrefixMatches =
+				scope.ftsIndexedLength === 0 || branch[scope.ftsIndexedLength - 1]?.id === scope.ftsIndexedTailId;
+			const ftsStartIndex = ftsPrefixMatches ? scope.ftsIndexedLength : 0;
+			const indexedRecords = memoryRecordsFromBranch(branch, scope.sessionId, scope.branchId, ftsStartIndex);
 			try {
 				const store = await ensureMemoryStore();
-				store.index(records);
+				store.index(indexedRecords);
+				scope.ftsIndexedLength = branch.length;
+				scope.ftsIndexedTailId = branch.at(-1)?.id ?? null;
 			} catch {
 				context.ui.notify(
 					"Session memory could not index the finalized turn; the Pi transcript remains the source of truth.",
 					"warning",
 				);
 			}
-			for (const entry of branch.slice(startIndex)) {
+
+			const todoPrefixMatches =
+				scope.todoProcessedLength === 0 || branch[scope.todoProcessedLength - 1]?.id === scope.todoProcessedTailId;
+			const todoStartIndex = todoPrefixMatches ? scope.todoProcessedLength : 0;
+			const todoRecords = memoryRecordsFromBranch(branch, scope.sessionId, scope.branchId, todoStartIndex);
+			for (const entry of branch.slice(todoStartIndex)) {
 				if (entry.type === "custom" && entry.customType === CHILD_RESULT_ENTRY && isRecord(entry.data)) {
 					scope.scheduler.requestUpdate({
 						scope: scope.state.scope,
@@ -1634,7 +1736,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 				const message = entry.message;
 				if (message.role === "user") {
 					const requestEntryId = entry.id;
-					const requestText = records.find((record) => record.entryId === entry.id)?.content ?? "";
+					const requestText = todoRecords.find((record) => record.entryId === entry.id)?.content ?? "";
 					const summary = boundedRedactedText(requestText, MAX_TODO_DELTA_CHARACTERS);
 					if (summary)
 						scope.scheduler.requestUpdate({
@@ -1670,7 +1772,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 										isRecord(execution) ? `${execution.name} ${execution.status}` : "Unknown operation",
 									)
 									.join("; ")
-							: (records.find((record) => record.entryId === entry.id)?.content ?? "");
+							: (todoRecords.find((record) => record.entryId === entry.id)?.content ?? "");
 					const summary = boundedRedactedText(contentText, MAX_TOOL_DELTA_CHARACTERS);
 					if (message.toolName === "task") {
 						scope.scheduler.requestUpdate({
@@ -1696,27 +1798,58 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 					}
 				}
 			}
-			scope.indexedLength = branch.length;
-			scope.indexedTailId = branch.at(-1)?.id ?? null;
+			scope.todoProcessedLength = branch.length;
+			scope.todoProcessedTailId = branch.at(-1)?.id ?? null;
 		};
 		pi.on("message_persisted", async (event, context) => {
 			if (event.message.role !== "user") return;
-			await processFinalizedEntries(context, event.entryId);
+			try {
+				await processFinalizedEntries(context, event.entryId);
+			} finally {
+				await syncPersistedTranscript(context, context.sessionManager.getSessionId());
+			}
 		});
 
 		pi.on("turn_end", (_event, context) => processFinalizedEntries(context));
-		pi.on("agent_end", (_event, context) => processFinalizedEntries(context));
-
-		pi.on("session_shutdown", async () => {
-			if (active) {
-				await disposeSessionScope(active);
-				active = undefined;
+		pi.on("agent_end", async (_event, context) => {
+			try {
+				await processFinalizedEntries(context);
+			} finally {
+				await syncPersistedTranscript(context, context.sessionManager.getSessionId());
 			}
-			await Promise.all(Object.values(clients).map((client) => client.close().catch(() => undefined)));
-			for (const server of Object.keys(clients)) delete clients[server];
-			for (const server of Object.keys(connecting)) delete connecting[server];
-			memory?.close();
-			memory = undefined;
+		});
+
+		pi.on("session_compact", async (_event, context) => {
+			try {
+				await processFinalizedEntries(context);
+			} finally {
+				await syncPersistedTranscript(context, context.sessionManager.getSessionId());
+			}
+		});
+
+		pi.on("session_shutdown", async (_event, context) => {
+			const scope = active;
+			try {
+				if (scope) {
+					try {
+						await processFinalizedEntries(context);
+					} catch {
+						context.ui.notify("Final session memory indexing failed before shutdown.", "warning");
+					}
+					try {
+						await disposeSessionScope(scope, "shutdown");
+					} finally {
+						await syncPersistedTranscript(context, scope.sessionId);
+						if (active === scope) active = undefined;
+					}
+				}
+			} finally {
+				await Promise.all(Object.values(clients).map((client) => client.close().catch(() => undefined)));
+				for (const server of Object.keys(clients)) delete clients[server];
+				for (const server of Object.keys(connecting)) delete connecting[server];
+				memory?.close();
+				memory = undefined;
+			}
 		});
 	};
 }

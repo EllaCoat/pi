@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { memoryRecordsFromAllBranches } from "../session-data.ts";
 import {
 	type CuratedMemory,
 	type MemoryCitation,
@@ -12,8 +14,15 @@ import {
 	type MemorySearchResult,
 	type MemorySourceRecord,
 	type MemorySourceRef,
+	type MemoryTranscriptRebuildResult as MemoryTranscriptRebuildStats,
 	redactSensitiveText,
 } from "./store.ts";
+import {
+	type MemoryTurnReadResult,
+	parseTranscriptSnapshot,
+	type TranscriptSnapshot,
+	type TranscriptSyncResult,
+} from "./transcript.ts";
 
 export type {
 	CuratedMemory,
@@ -32,11 +41,41 @@ export type {
 	MemorySourceRecord,
 	MemorySourceRef,
 } from "./store.ts";
+export type {
+	MemoryTurnEntry,
+	MemoryTurnReadResult,
+	TranscriptSyncResult,
+	TranscriptSyncStats,
+} from "./transcript.ts";
 
 export interface PersonalMemoryStoreOptions {
 	readonly databasePath: string;
 	/** Inject the host's task-adaptive model call. Usage accounting stays with that host. */
 	readonly curate?: MemoryCurator;
+}
+
+export type MemoryTranscriptRebuildResult =
+	| ({ readonly status: "rebuilt" } & MemoryTranscriptRebuildStats)
+	| Extract<TranscriptSyncResult, { readonly status: "not-persisted" }>;
+
+type TranscriptLoadResult =
+	| { readonly status: "ready"; readonly snapshot: TranscriptSnapshot }
+	| Extract<TranscriptSyncResult, { readonly status: "not-persisted" }>;
+
+function readTranscriptSnapshot(sessionFile: string | undefined, sessionId: string): TranscriptLoadResult {
+	if (sessionFile === undefined) {
+		return { status: "not-persisted", sessionId, reason: "session-file-unavailable" };
+	}
+	let contents: string;
+	try {
+		contents = readFileSync(sessionFile, "utf8");
+	} catch (error: unknown) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+			return { status: "not-persisted", sessionId, reason: "session-file-missing" };
+		}
+		throw error;
+	}
+	return { status: "ready", snapshot: parseTranscriptSnapshot(contents, sessionId) };
 }
 
 export type MemoryRecallReason =
@@ -114,7 +153,7 @@ function renderExcerpts(records: readonly MemoryExcerpt[]): string {
 
 /**
  * Public facade for the SQLite search copy and just-in-time recall. The Pi transcript remains
- * authoritative; this store keeps only sanitized text, source provenance, and user directives.
+ * authoritative; raw transcript copies stay separate from sanitized search and read results.
  */
 export class PersonalMemoryStore {
 	readonly #index: MemoryIndex;
@@ -135,6 +174,31 @@ export class PersonalMemoryStore {
 
 	rebuild(records: readonly MemorySourceRecord[]): MemoryIndexResult {
 		return this.#index.rebuild(records);
+	}
+
+	/** Mirrors the on-disk JSONL only; search-index status is tracked separately by the caller. */
+	syncTranscript(sessionFile: string | undefined, sessionId: string): TranscriptSyncResult {
+		const loaded = readTranscriptSnapshot(sessionFile, sessionId);
+		if (loaded.status !== "ready") return loaded;
+		return { status: "synced", ...this.#index.syncTranscript(loaded.snapshot) };
+	}
+
+	/** Rebuilds this session's raw mirror and every searchable branch atomically from JSONL. */
+	rebuildFromTranscript(sessionFile: string | undefined, sessionId: string): MemoryTranscriptRebuildResult {
+		const loaded = readTranscriptSnapshot(sessionFile, sessionId);
+		if (loaded.status !== "ready") return loaded;
+		const records = memoryRecordsFromAllBranches(
+			loaded.snapshot.entries.map((entry) => entry.sessionEntry),
+			loaded.snapshot.sessionId,
+		);
+		return {
+			status: "rebuilt",
+			...this.#index.rebuildFromTranscript(loaded.snapshot, records),
+		};
+	}
+
+	readTurn(sessionId: string, userTurnId: string, leafEntryId: string): MemoryTurnReadResult {
+		return this.#index.readTurn(sessionId, userTurnId, leafEntryId);
 	}
 
 	search(query: string, scope?: MemoryScope): MemorySearchResult {
