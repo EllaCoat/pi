@@ -27,8 +27,8 @@ describe("issue #3303 nested .gitignore rules leak into sibling directories", ()
 		if (text === "No files found matching pattern") return [];
 		return text
 			.split("\n")
-			.map((l) => l.trim())
-			.filter((l) => l.length > 0 && !l.startsWith("["))
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0 && !line.startsWith("["))
 			.sort();
 	}
 
