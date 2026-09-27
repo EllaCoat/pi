@@ -409,9 +409,11 @@ function getBuiltinThemes(): Record<string, ThemeJson> {
 		const themesDir = getThemesDir();
 		const darkPath = path.join(themesDir, "dark.json");
 		const lightPath = path.join(themesDir, "light.json");
+		const axiaPath = path.join(themesDir, "axia.json");
 		BUILTIN_THEMES = {
 			dark: JSON.parse(stripBom(fs.readFileSync(darkPath, "utf-8"))) as ThemeJson,
 			light: JSON.parse(stripBom(fs.readFileSync(lightPath, "utf-8"))) as ThemeJson,
+			axia: JSON.parse(stripBom(fs.readFileSync(axiaPath, "utf-8"))) as ThemeJson,
 		};
 	}
 	return BUILTIN_THEMES;

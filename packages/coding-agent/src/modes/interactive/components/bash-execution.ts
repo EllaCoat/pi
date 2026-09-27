@@ -12,6 +12,7 @@ import {
 import { stripAnsi } from "../../../utils/ansi.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
+import { ToolContentPreview } from "./input-preview.ts";
 import { keyHint, keyText } from "./keybinding-hints.ts";
 import { truncateToVisualLines } from "./visual-truncate.ts";
 
@@ -49,7 +50,7 @@ export class BashExecutionComponent extends Container {
 
 		// Command header
 		const header = new Text(theme.fg(colorKey, theme.bold(`$ ${command}`)), 1, 0);
-		this.contentContainer.addChild(header);
+		this.contentContainer.addChild(new ToolContentPreview(header, this.expanded));
 
 		// Loader
 		this.loader = new Loader(
@@ -136,7 +137,7 @@ export class BashExecutionComponent extends Container {
 
 		// Command header
 		const header = new Text(theme.fg("bashMode", theme.bold(`$ ${this.command}`)), 1, 0);
-		this.contentContainer.addChild(header);
+		this.contentContainer.addChild(new ToolContentPreview(header, this.expanded));
 
 		// Output
 		if (availableLines.length > 0) {

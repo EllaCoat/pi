@@ -274,4 +274,24 @@ describe("AssistantMessageComponent", () => {
 		const unpaddedLines = unpaddedComponent.render(40).map((line) => stripAnsi(line));
 		expect(unpaddedLines.some((line) => line.startsWith("hello"))).toBe(true);
 	});
+	test("preserves full assistant and user text at narrow widths", () => {
+		initTheme("dark");
+		const assistantText = `${"assistant content ".repeat(32)}END`;
+		const assistant = new AssistantMessageComponent(createAssistantMessage([{ type: "text", text: assistantText }]));
+		expect(stripAnsi(assistant.render(18).join("\n"))).toContain("END");
+
+		const userText = `${"user content ".repeat(32)}USEREND`;
+		const user = new UserMessageComponent(userText);
+		expect(stripAnsi(user.render(18).join("\n"))).toContain("USEREND");
+	});
+
+	test("preserves the provider reasoning summary without generating a replacement", () => {
+		initTheme("dark");
+		const summary = `${"provider summary ".repeat(32)}SUMMARYEND`;
+		const component = new AssistantMessageComponent(
+			createAssistantMessage([{ type: "thinking", thinking: summary }]),
+		);
+
+		expect(stripAnsi(component.render(18).join("\n"))).toContain("SUMMARYEND");
+	});
 });

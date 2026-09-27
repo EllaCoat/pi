@@ -125,7 +125,7 @@ describe("edit tool TUI rendering", () => {
 			() => tui.requestRender(true),
 		);
 		expect(callOnlyRender).toContain("edit");
-		expect(callOnlyRender).toContain("line 950 changed");
+		expect(callOnlyRender).not.toContain("line 950 changed");
 
 		const redrawsBeforeResult = tui.fullRedraws;
 		const clearsBeforeResult = terminal.fullClearCount;
@@ -145,8 +145,13 @@ describe("edit tool TUI rendering", () => {
 
 		const settledRender = component.render(80).join("\n");
 		expect(settledRender).toContain("line 50 changed");
-		expect(settledRender).toContain("line 950 changed");
+		expect(settledRender).not.toContain("line 950 changed");
 		expect(settledRender).not.toContain("Successfully replaced");
+		component.setExpanded(true);
+		const expandedRender = component.render(80).join("\n");
+		expect(expandedRender).toContain("line 50 changed");
+		expect(expandedRender).toContain("line 950 changed");
+		expect(expandedRender).toContain("Successfully replaced");
 	});
 
 	it("reconstructs the boxed preview from a settled result without argsComplete", async () => {
@@ -195,7 +200,11 @@ describe("edit tool TUI rendering", () => {
 
 		const rendered = component.render(80).join("\n");
 		expect(rendered).toContain("line 50 changed");
-		expect(rendered).toContain("line 150 changed");
+		expect(rendered).not.toContain("line 150 changed");
+		component.setExpanded(true);
+		const expandedRender = component.render(80).join("\n");
+		expect(expandedRender).toContain("line 50 changed");
+		expect(expandedRender).toContain("line 150 changed");
 	});
 
 	it("shows a preflight error without rendering a diff when the edits do not apply", async () => {
