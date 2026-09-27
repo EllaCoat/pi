@@ -210,6 +210,19 @@ describe("personal harness Code Mode", () => {
 		expect(laterPython.harnessDerivedRecall).toBe(true);
 		expect(laterPython.toolExecutions).toEqual([]);
 	});
+	it("marks notes search and read as derived recall across Code Mode calls", async () => {
+		const session = createSession("derived-notes", (name, args) => ({ name, args }));
+		const search = await session.execute(
+			"javascript",
+			'globalThis.noteSearch = await tool.notes({action: "search", query: "prior work"}); noteSearch.name',
+		);
+		expect(search.harnessDerivedRecall).toBe(true);
+		expect(search.toolExecutions).toEqual([{ name: "notes", status: "success", harnessDerivedRecall: true }]);
+		const read = await session.execute("python", 'await tool.notes({"action": "read", "id": "project/example.md"})');
+		expect(read.harnessDerivedRecall).toBe(true);
+		expect(read.toolExecutions).toEqual([{ name: "notes", status: "success", harnessDerivedRecall: true }]);
+		expect((await session.execute("javascript", "noteSearch.name")).harnessDerivedRecall).toBe(true);
+	});
 
 	it("honors explicit derived-recall details without tainting memory writes", async () => {
 		const marked = createSession("derived-details", () => ({

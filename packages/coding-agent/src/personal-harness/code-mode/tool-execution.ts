@@ -1,6 +1,7 @@
 import type { CodeModeToolExecution } from "./types.ts";
 
 const MEMORY_RECALL_ACTIONS: Record<string, true> = { read: true, search: true, recall: true };
+const NOTES_RECALL_ACTIONS: Record<string, true> = { read: true, search: true };
 const NAMED_MEMORY_RECALL = /^memory[._:/-](?:read|search|recall)$/i;
 
 export function describeToolExecution(name: string, args: unknown, result: unknown): CodeModeToolExecution {
@@ -15,7 +16,7 @@ export function describeToolExecution(name: string, args: unknown, result: unkno
 export function isDerivedRecallCall(name: string, args: unknown): boolean {
 	if (name === "recall" || NAMED_MEMORY_RECALL.test(name)) return true;
 	if (
-		name !== "memory" ||
+		(name !== "memory" && name !== "notes") ||
 		typeof args !== "object" ||
 		args === null ||
 		!("action" in args) ||
@@ -23,7 +24,7 @@ export function isDerivedRecallCall(name: string, args: unknown): boolean {
 	) {
 		return false;
 	}
-	return Object.hasOwn(MEMORY_RECALL_ACTIONS, args.action);
+	return Object.hasOwn(name === "notes" ? NOTES_RECALL_ACTIONS : MEMORY_RECALL_ACTIONS, args.action);
 }
 
 export function hasDerivedRecallMarker(value: unknown): boolean {

@@ -80,6 +80,7 @@ function profileInstructions(serverNames: readonly string[]): string {
 			JSON.stringify(serverNames) +
 			".",
 		'- Resolve OMP `skill://name[/relative/path]` references on demand with `await tool.skill_read({uri: "skill://name[/relative/path]"})`; the URI is limited to the supplied extra skill roots. Pi\'s normal skill list and `/skill:name` expansion remain available.',
+		'- Search shared Markdown notes in eval with `await tool.notes({action: "search", query: "...", scope: "workspace"})` (omit scope for the normal combined search or use `"global"` for global-only), then read one result with `await tool.notes({action: "read", id: "..."})`. If no notes root was configured, the tool reports unavailable instead of searching another path.',
 		"- The Goal tool accepts create/get/edit/block/resume/complete/drop. edit updates the objective without changing status; block requires a reason and stops automatic continuation. Active Goals auto-continue in TUI mode until completed or explicitly stopped. Preserve user approval boundaries. /goal provides show/edit/block/pause/resume/budget commands; pause and budget are not model tool operations.",
 		"- Code Mode is an execution interface, not an OS sandbox. Preserve inherited instructions and approval hooks; do not treat prompt guidance as a replacement for host tool permissions.",
 	].join("\n");

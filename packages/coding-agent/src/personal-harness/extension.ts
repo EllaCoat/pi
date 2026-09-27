@@ -41,7 +41,7 @@ import {
 	LUNA_HIGH_FAST,
 	LUNA_MAX,
 } from "./model-call.ts";
-
+import { MarkdownNotesStore } from "./notes/index.ts";
 import { branchIdForEntries, latestTodoSnapshot, memoryRecordsFromBranch } from "./session-data.ts";
 import { createPiSubagentSessionFactory } from "./subagent-factory.ts";
 import {
@@ -153,7 +153,12 @@ const MemoryParameters = Type.Object({
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 3 })),
 	offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 500 })),
 });
-
+const NotesParameters = Type.Object({
+	action: Type.Union([Type.Literal("search"), Type.Literal("read")]),
+	query: Type.Optional(Type.String({ minLength: 1 })),
+	id: Type.Optional(Type.String({ minLength: 1 })),
+	scope: Type.Optional(Type.Union([Type.Literal("global"), Type.Literal("workspace")])),
+});
 const TodoParameters = Type.Object({
 	action: Type.Union([
 		Type.Literal("list"),
@@ -251,7 +256,8 @@ export interface PersonalHarnessExtensionOptions {
 	/** Paths to skills and private hook values are references supplied by the caller, never embedded in this module. */
 	readonly inheritedSkillPaths?: readonly string[];
 	readonly hookValues?: Omit<Partial<HarnessHookOptions>, "evaluate" | "hold" | "ledger">;
-
+	/** Explicit Markdown notes root. Unset means notes are unavailable; no default root is searched. */
+	readonly notesRoot?: string;
 	readonly backgroundTodoModel?: HarnessModelSelection;
 	readonly memoryCuratorModel?: HarnessModelSelection;
 	readonly webSearchModel?: HarnessModelSelection;
@@ -670,7 +676,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		const clients: Record<string, HarnessMcpClient> = {};
 		const connecting: Record<string, Promise<HarnessMcpClient>> = {};
 		let memory: PersonalMemoryStore | undefined;
-
+		let notesStore: MarkdownNotesStore | undefined;
 		let currentRegistry: ModelRegistry | undefined;
 		let evaluateHooks: JevEvaluator = async () => {
 			throw new Error("Jev server and tool are not configured");
@@ -738,6 +744,31 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 				},
 			});
 			return memory;
+		}
+		async function executeNotes(
+			params: Static<typeof NotesParameters>,
+			context: ExtensionContext,
+			signal?: AbortSignal,
+		): Promise<AgentToolResult<unknown>> {
+			signal?.throwIfAborted();
+			const root = options.notesRoot?.trim();
+			if (!root)
+				return derivedMemoryResult({ status: "unavailable", reason: "No shared notes root was configured." });
+			notesStore ??= new MarkdownNotesStore({ root: resolvePath(root), evaluate: evaluateHooks });
+			const store = notesStore;
+			if (params.action === "search") {
+				if (!params.query?.trim()) return toolResult("notes search requires a query", true);
+				return derivedMemoryResult(
+					await store.search(
+						{ query: params.query, cwd: context.cwd, ...(params.scope ? { scope: params.scope } : {}) },
+						signal,
+					),
+				);
+			}
+			if (!params.id?.trim()) return toolResult("notes read requires an ID", true);
+			const result = await store.read({ id: params.id, cwd: context.cwd });
+			signal?.throwIfAborted();
+			return derivedMemoryResult(result);
 		}
 
 		function formatTodo(snapshot: TodoSnapshot): string[] {
@@ -1336,6 +1367,21 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 				}
 			},
 		});
+		pi.registerTool({
+			name: "notes",
+			label: "shared notes",
+			description: "Search or read explicitly configured Markdown notes; the notes root is never guessed.",
+			promptSnippet: "Search notes by query and optional scope, or read one returned note ID.",
+			parameters: NotesParameters,
+			constrainedSampling: { type: "json_schema", strict: "prefer" },
+			execute: async (_id, params, _signal, _update, context) => {
+				try {
+					return await executeNotes(params, context, _signal);
+				} catch (error) {
+					return toolResult(error instanceof Error ? error.message : "Notes operation failed", true);
+				}
+			},
+		});
 
 		pi.registerTool({
 			name: "web_search",
@@ -1503,7 +1549,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 
 		pi.on("tool_result", (event) => {
 			if (
-				["ask", "eval", "task", "recall", "memory", "todo", "mcp", "web_search", "usage", "goal"].includes(
+				["ask", "eval", "task", "recall", "memory", "notes", "todo", "mcp", "web_search", "usage", "goal"].includes(
 					event.toolName,
 				) &&
 				isRecord(event.details) &&
@@ -1746,14 +1792,14 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 							summary,
 						});
 				} else if (message.role === "toolResult") {
-					if (["todo", "memory", "recall", "tool_info"].includes(message.toolName)) continue;
+					if (["todo", "memory", "recall", "notes", "tool_info"].includes(message.toolName)) continue;
 					const details = isRecord(message.details) ? message.details : undefined;
 					const executions =
 						message.toolName === "eval" && Array.isArray(details?.toolExecutions) ? details.toolExecutions : [];
 					const operations = executions.filter(
 						(execution) =>
 							isRecord(execution) &&
-							!["todo", "memory", "recall", "task", "tool_info"].includes(String(execution.name)),
+							!["todo", "memory", "recall", "notes", "task", "tool_info"].includes(String(execution.name)),
 					);
 					if (
 						message.toolName === "eval" &&

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -430,6 +430,78 @@ describe("personal harness extension in an AgentSession", () => {
 			}
 		},
 	);
+	it("reports notes unavailable without an explicitly configured root", async () => {
+		const harness = await create(dataDirectory());
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("notes", { action: "search", query: "private fixture marker" })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("Notes lookup is unavailable."),
+		]);
+
+		await harness.session.prompt("Search the configured notes.");
+
+		expect(resultText(harness, "notes")[0]).toContain("No shared notes root was configured");
+		expect(resultText(harness, "notes")[0]).not.toContain("private fixture marker");
+	});
+
+	it("marks notes search/read through Code Mode as derived and excludes note text from session memory", async () => {
+		const dataDir = dataDirectory();
+		const notesRoot = join(dataDir, "fixture-notes");
+		mkdirSync(notesRoot, { recursive: true });
+		writeFileSync(
+			join(notesRoot, "cobalt.md"),
+			"---\nscope: global\ndescription: Fixture note for isolated search.\nverified_at: 2026-09-27\nconfidence: 1\n---\n\n# Cobalt fixture\n\nThe cobalt fixture marker lives in this artificial note.\n",
+		);
+		const harness = await create(dataDir, {}, { notesRoot });
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("eval", {
+						language: "javascript",
+						code: "globalThis.fixtureNotes = JSON.parse((await tool.notes({action:'search',query:'cobalt fixture marker'})).content[0].text); globalThis.fixtureNote = JSON.parse((await tool.notes({action:'read',id:fixtureNotes.results[0].id})).content[0].text); display({search:fixtureNotes,read:fixtureNote});",
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("Read the synthetic note."),
+		]);
+
+		await harness.session.prompt("Search and read the synthetic note.");
+
+		const evalResult = harness.sessionManager
+			.getBranch()
+			.findLast(
+				(entry) =>
+					entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "eval",
+			);
+		const evalMessage =
+			evalResult?.type === "message" && evalResult.message.role === "toolResult" ? evalResult.message : undefined;
+		expect(evalMessage).toMatchObject({
+			details: {
+				harnessDerivedRecall: true,
+				toolExecutions: [
+					{ name: "notes", status: "success", harnessDerivedRecall: true },
+					{ name: "notes", status: "success", harnessDerivedRecall: true },
+				],
+			},
+		});
+		const noteExecutions = (
+			evalMessage?.details as
+				| { toolExecutions?: { name: string; status: string; harnessDerivedRecall?: boolean }[] }
+				| undefined
+		)?.toolExecutions;
+		expect(noteExecutions).toHaveLength(2);
+		expect(resultText(harness, "eval")[0]).toContain("Cobalt fixture");
+		expect(resultText(harness, "eval")[0]).toContain("The cobalt fixture marker lives in this artificial note.");
+
+		const reader = new PersonalMemoryStore({ databasePath: join(dataDir, "memory.sqlite") });
+		try {
+			expect(reader.search("cobalt fixture marker lives").candidates).toHaveLength(0);
+		} finally {
+			reader.close();
+		}
+	});
 
 	it("does not turn a failed nested operation into successful TODO evidence", async () => {
 		const fail: AgentTool = {

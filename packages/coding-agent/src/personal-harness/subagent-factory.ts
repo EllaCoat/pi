@@ -40,6 +40,7 @@ const CHILD_ONLY_TOOLS: Record<string, true> = {
 	goal: true,
 	eval: true,
 	memory: true,
+	notes: true,
 	recall: true,
 	task: true,
 	todo: true,
