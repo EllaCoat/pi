@@ -471,4 +471,43 @@ describe("SessionManager session file creation", () => {
 
 		expect(readSessionFileRoles(session.getSessionFile()!)).toEqual(["session", "user", "custom", "assistant"]);
 	});
+
+	it("round-trips assistant cost provenance through session persistence", () => {
+		const session = SessionManager.create(tempDir, tempDir);
+		for (const known of [true, false, undefined] as const) {
+			session.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "answer" }],
+				api: "openai-responses",
+				provider: "openai",
+				model: "test",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						total: 0,
+						...(known === undefined ? {} : { known }),
+					},
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+		}
+
+		const file = session.getSessionFile()!;
+		const knownValues = SessionManager.open(file, tempDir)
+			.getEntries()
+			.flatMap((entry) =>
+				entry.type === "message" && entry.message.role === "assistant" ? [entry.message.usage.cost.known] : [],
+			);
+
+		expect(knownValues).toEqual([true, false, undefined]);
+	});
 });

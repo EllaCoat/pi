@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
@@ -113,6 +113,47 @@ describe("SessionManager append and tree traversal", () => {
 			expect(customEntry.data).toEqual({ key: "value" });
 
 			expect(entries[2].parentId).toBe(customId);
+		});
+
+		it("appends an explicit-parent custom entry without moving the active leaf and restores it from JSONL", () => {
+			const tempDir = mkdtempSync(join(tmpdir(), "pi-session-manager-detached-"));
+			try {
+				const session = SessionManager.create(tempDir, tempDir);
+				const rootId = session.appendMessage(userMsg("root"));
+				const oldLeafId = session.appendMessage(assistantMsg("old branch"));
+				session.branch(rootId);
+				const activeLeafId = session.appendMessage(assistantMsg("active branch"));
+
+				const detachedId = session.appendCustomEntry(
+					"detached_usage",
+					{ estimatedUsd: 0.9 },
+					{ parentId: oldLeafId },
+				);
+				const rootDetachedId = session.appendCustomEntry("detached_root", {}, { parentId: null });
+				expect(() => session.appendCustomEntry("invalid_parent", {}, { parentId: "missing" })).toThrow(
+					"Entry missing not found",
+				);
+				expect(session.getLeafId()).toBe(activeLeafId);
+				expect(session.getEntry(detachedId)).toMatchObject({
+					parentId: oldLeafId,
+					resumeLeafId: activeLeafId,
+				});
+				expect(session.getEntry(rootDetachedId)).toMatchObject({ parentId: null, resumeLeafId: activeLeafId });
+
+				const file = session.getSessionFile();
+				if (!file) throw new Error("Persisted session file was not available");
+				const reopened = SessionManager.open(file, tempDir);
+				expect(reopened.getLeafId()).toBe(activeLeafId);
+				expect(reopened.getBranch().map((entry) => entry.id)).toEqual([rootId, activeLeafId]);
+				expect(reopened.getEntry(detachedId)).toMatchObject({
+					parentId: oldLeafId,
+					resumeLeafId: activeLeafId,
+					data: { estimatedUsd: 0.9 },
+				});
+				expect(reopened.getEntry(rootDetachedId)).toMatchObject({ parentId: null });
+			} finally {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
 		});
 
 		it("leaf pointer advances after each append", () => {

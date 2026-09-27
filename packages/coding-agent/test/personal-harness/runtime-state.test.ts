@@ -1,5 +1,5 @@
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
-import type { Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import { HarnessGoalStore } from "../../src/personal-harness/goal.ts";
 import {
@@ -60,6 +60,69 @@ describe("personal harness runtime state", () => {
 		expect(factory).toHaveBeenCalledTimes(2);
 		expect(delivered).toHaveBeenCalledTimes(2);
 		expect(delivered.mock.calls.every((call) => call[1] === true)).toBe(true);
+		await manager.close();
+	});
+
+	it("persists only child assistant API-equivalent cost and marks missing failed usage unknown", async () => {
+		const helperUsage: Usage = { ...usage, cost: { ...usage.cost, total: 0.75 } };
+		const childUsage: Usage = { ...usage, cost: { ...usage.cost, total: 0.33 } };
+		const failedZeroUsage: Usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const makeAssistantMessage = (
+			messageUsage: Usage,
+			stopReason: AssistantMessage["stopReason"],
+		): AssistantMessage =>
+			({
+				role: "assistant",
+				content: [],
+				api: "faux",
+				provider: "fixture",
+				model: "one",
+				usage: messageUsage,
+				stopReason,
+				timestamp: Date.now(),
+			}) as AssistantMessage;
+		const ledger = new HarnessUsageLedger();
+		let emit: ((event: AgentEvent) => void) | undefined;
+		const manager = new HarnessSubagents({
+			createSession: async () => ({
+				prompt: async () => {
+					emit?.({ type: "message_end", message: makeAssistantMessage(childUsage, "stop") });
+					emit?.({ type: "message_end", message: makeAssistantMessage(failedZeroUsage, "error") });
+					ledger.record({
+						purpose: "compact",
+						model: "background-helper",
+						status: "success",
+						durationMs: 1,
+						usage: helperUsage,
+					});
+				},
+				send: async () => {},
+				abort: async () => {},
+				dispose: async () => {},
+				getLastAssistantText: () => "child result",
+				subscribe: (listener) => {
+					emit = listener;
+					return () => {};
+				},
+			}),
+			ledger,
+		});
+
+		const childJob = manager.start(request);
+		const result = await waitForResult(manager, childJob.id);
+
+		expect(result.apiEquivalentCost).toEqual({ estimatedUsd: 0.33, unknownCalls: 1 });
+		expect(ledger.snapshot()).toMatchObject({
+			subagent: { calls: 2, unknownUsage: 1, estimatedUsd: 0.33 },
+			compact: { calls: 1, estimatedUsd: 0.75 },
+		});
 		await manager.close();
 	});
 
@@ -194,15 +257,17 @@ describe("personal harness runtime state", () => {
 		expect((await waitForResult(manager, next.id)).status).toBe("completed");
 		await manager.close();
 	});
-	it("restores settled results without allocating a model session", async () => {
+	it("restores settled results without allocating a model session or inventing usage", async () => {
 		const factory = vi.fn(async () => child("unexpected"));
 		const manager = new HarnessSubagents({ createSession: factory, ledger: new HarnessUsageLedger() });
 		manager.restore([
 			{ id: "old", provider: "fixture", model: "one", status: "completed", text: "saved result", durationMs: 5 },
 		]);
 		expect((await waitForResult(manager, "old")).text).toBe("saved result");
+		expect(manager.result("old")?.apiEquivalentCost).toBeUndefined();
 		expect(factory).not.toHaveBeenCalled();
-		await manager.close();
+		expect(await manager.close()).toEqual([]);
+		expect(manager.result("old")?.apiEquivalentCost).toBeUndefined();
 	});
 
 	it("records unknown usage separately and never adds reasoning twice", () => {

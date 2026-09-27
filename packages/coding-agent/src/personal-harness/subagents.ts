@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { AgentEvent, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+	type ApiEquivalentCostSummary,
+	addAssistantApiEquivalentCost,
+	emptyApiEquivalentCost,
+} from "./api-equivalent-cost.ts";
 import { type HarnessUsageLedger, reportedModelUsage } from "./usage.ts";
 
 export interface HarnessSubagentMcpAccess {
@@ -34,6 +39,7 @@ export interface HarnessSubagentResult {
 	text: string;
 	error?: string;
 	durationMs: number;
+	apiEquivalentCost?: ApiEquivalentCostSummary;
 }
 export interface HarnessSubagentMessage {
 	id: string;
@@ -56,6 +62,7 @@ export interface HarnessSubagentOptions {
 	) => Promise<HarnessChildSession>;
 	ledger: HarnessUsageLedger;
 	maxParallel?: number;
+	onUsage?: (childId: string, summary: ApiEquivalentCostSummary) => void;
 	onMessage?: (message: HarnessSubagentMessage, waiting: boolean) => void;
 	onResult?: (result: HarnessSubagentResult, waiting: boolean) => void;
 }
@@ -83,6 +90,7 @@ interface ChildJob {
 	replyWaiters: ParentReplyWaiter[];
 	pendingParentMessages: string[];
 	startedAt: number;
+	apiEquivalentCost: ApiEquivalentCostSummary;
 }
 
 /** State inspection and result retrieval never start another model turn. */
@@ -124,6 +132,7 @@ export class HarnessSubagents {
 			replyWaiters: [],
 			pendingParentMessages: [],
 			startedAt: performance.now(),
+			apiEquivalentCost: emptyApiEquivalentCost(),
 		};
 		this.#jobs.set(job.id, job);
 		this.#queue.push(job);
@@ -214,22 +223,35 @@ export class HarnessSubagents {
 				replyWaiters: [],
 				pendingParentMessages: [],
 				startedAt: 0,
+				apiEquivalentCost: result.apiEquivalentCost ? { ...result.apiEquivalentCost } : emptyApiEquivalentCost(),
 			});
 		}
 	}
 
-	async close(): Promise<void> {
+	async close(): Promise<HarnessSubagentResult[]> {
 		this.#closed = true;
-		await this.cancelAll();
+		return this.cancelAll();
 	}
 
-	async cancelAll(): Promise<void> {
+	async cancelAll(): Promise<HarnessSubagentResult[]> {
 		const jobs = [...this.#jobs.values()].filter((job) => !job.result);
 		await Promise.all(
 			jobs.map(async (job) => {
 				await this.cancel(job.id);
 				await job.completion;
 			}),
+		);
+		return jobs.flatMap((job) =>
+			job.result
+				? [
+						{
+							...job.result,
+							...(job.result.apiEquivalentCost
+								? { apiEquivalentCost: { ...job.result.apiEquivalentCost } }
+								: {}),
+						},
+					]
+				: [],
 		);
 	}
 
@@ -299,11 +321,18 @@ export class HarnessSubagents {
 			job.controller.signal.throwIfAborted();
 			unsubscribe = job.session.subscribe((event) => {
 				if (event.type === "turn_start") turnStarted = performance.now();
-				if (event.type !== "message_end" || event.message.role !== "assistant") return;
+				if (
+					event.type !== "message_end" ||
+					event.message.role !== "assistant" ||
+					job.result ||
+					job.status !== "running"
+				)
+					return;
 				const message = event.message;
 				const messageStatus =
 					message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "success";
 				lastError = messageStatus === "success" ? undefined : (message.errorMessage ?? message.stopReason);
+				addAssistantApiEquivalentCost(job.apiEquivalentCost, message);
 				this.#options.ledger.record({
 					purpose: "subagent",
 					model: `${message.provider}/${message.model}`,
@@ -311,6 +340,7 @@ export class HarnessSubagents {
 					usage: reportedModelUsage(message),
 					durationMs: performance.now() - turnStarted,
 				});
+				this.#options.onUsage?.(job.id, { ...job.apiEquivalentCost });
 			});
 			for (const message of job.pendingParentMessages.splice(0)) await job.session.send(message);
 			const prompt = job.request.context?.trim()
@@ -347,6 +377,7 @@ export class HarnessSubagents {
 			text,
 			...(error ? { error } : {}),
 			durationMs: performance.now() - job.startedAt,
+			apiEquivalentCost: { ...job.apiEquivalentCost },
 		};
 		const result = { ...job.result };
 		const waiting = job.waiters.length > 0;

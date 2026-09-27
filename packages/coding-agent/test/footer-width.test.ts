@@ -1,3 +1,4 @@
+import { sep } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
@@ -24,6 +25,8 @@ function createSession(options: {
 	branchUsage?: AssistantUsage;
 	compactionUsage?: AssistantUsage;
 	toolUsage?: AssistantUsage;
+	helperUsage?: AssistantUsage;
+	childCost?: { estimatedUsd: number; unknownCalls: number };
 	usingSubscription?: boolean;
 }): AgentSession {
 	const usage = options.usage;
@@ -60,6 +63,23 @@ function createSession(options: {
 				role: "toolResult",
 				usage: options.toolUsage,
 			},
+		});
+	}
+	if (options.helperUsage !== undefined) {
+		entries.push({
+			type: "usage",
+			kind: "memory",
+			provider: "test",
+			model: "helper",
+			usage: options.helperUsage,
+		});
+	}
+
+	if (options.childCost !== undefined) {
+		entries.push({
+			type: "custom",
+			customType: "personal-harness-child-result",
+			data: { apiEquivalentCost: options.childCost },
 		});
 	}
 
@@ -108,7 +128,7 @@ describe("formatCwdForFooter", () => {
 
 	it("abbreviates the home directory and descendants", () => {
 		expect(formatCwdForFooter("/home/user", "/home/user")).toBe("~");
-		expect(formatCwdForFooter("/home/user/project", "/home/user")).toBe("~/project");
+		expect(formatCwdForFooter("/home/user/project", "/home/user")).toBe(`~${sep}project`);
 	});
 });
 
@@ -152,7 +172,7 @@ describe("FooterComponent width handling", () => {
 		}
 	});
 
-	it("includes summary and tool result usage in the total cost", () => {
+	it("counts main and saved child costs while excluding summaries, compaction, tools, and helpers", () => {
 		const session = createSession({
 			sessionName: "",
 			usage: {
@@ -183,11 +203,55 @@ describe("FooterComponent width handling", () => {
 				cacheWrite: 0,
 				cost: { total: 0.375 },
 			},
+			helperUsage: {
+				input: 50,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.75 },
+			},
+			childCost: { estimatedUsd: 0.25, unknownCalls: 0 },
 		});
 		const footer = new FooterComponent(session, createFooterData(1));
 
-		const statsLine = stripAnsi(footer.render(120)[1]);
-		expect(statsLine).toContain("$1.250");
+		expect(stripAnsi(footer.render(120)[0])).toContain("API換算 ≈$0.7500");
+	});
+
+	it("shows an unknown marker instead of treating unknown child cost as free", () => {
+		const session = createSession({
+			sessionName: "",
+			childCost: { estimatedUsd: 0, unknownCalls: 1 },
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		expect(stripAnsi(footer.render(120)[0])).toContain("API換算 ≈$0.0000+?");
+	});
+
+	it("keeps model, effort, API-equivalent cost, context percent, and bar visible at 40, 80, and 120 columns", () => {
+		const session = createSession({
+			sessionName: "",
+			modelId: "gpt-test",
+			thinkingLevel: "high",
+			usage: {
+				input: 10,
+				output: 2,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.125 },
+			},
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		for (const width of [40, 80, 120]) {
+			const lines = footer.render(width);
+			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			const text = stripAnsi(lines.join(" "));
+			expect(text).toContain("gpt-test");
+			expect(text).toContain("Effort high");
+			expect(text).toContain("API換算 ≈$0.1250");
+			expect(text).toContain("12.3%");
+			expect(text).toContain("█");
+		}
 	});
 
 	it("shows the latest cache hit rate when cache usage is present", () => {
@@ -207,7 +271,7 @@ describe("FooterComponent width handling", () => {
 		expect(statsLine).toContain("CH25.0%");
 	});
 
-	it("marks Kimi Coding costs as subscription estimates", () => {
+	it("shows API-equivalent costs without calling them subscription charges", () => {
 		const session = createSession({
 			sessionName: "",
 			provider: "kimi-coding",
@@ -220,18 +284,22 @@ describe("FooterComponent width handling", () => {
 			},
 		});
 		const footer = new FooterComponent(session, createFooterData(1));
+		const stats = stripAnsi(footer.render(120)[0]);
 
-		expect(stripAnsi(footer.render(120)[1])).toContain("$1.234 (sub)");
+		expect(stats).toContain("API換算 ≈$1.2340");
+		expect(stats).not.toContain("(sub)");
 	});
 
-	it("marks explicitly identified subscription auth", () => {
+	it("shows zero when no cost-bearing model messages exist", () => {
 		const session = createSession({ sessionName: "", provider: "anthropic", usingSubscription: true });
 		const footer = new FooterComponent(session, createFooterData(1));
+		const stats = stripAnsi(footer.render(120)[0]);
 
-		expect(stripAnsi(footer.render(120)[1])).toContain("$0.000 (sub)");
+		expect(stats).toContain("API換算 ≈$0.0000");
+		expect(stats).not.toContain("(sub)");
 	});
 
-	it("does not mark generic OAuth sign-in as a subscription", () => {
+	it("does not label generic OAuth costs as subscription charges", () => {
 		const session = createSession({
 			sessionName: "",
 			provider: "openrouter",
@@ -244,9 +312,9 @@ describe("FooterComponent width handling", () => {
 			},
 		});
 		const footer = new FooterComponent(session, createFooterData(1));
-		const stats = stripAnsi(footer.render(120)[1]);
+		const stats = stripAnsi(footer.render(120)[0]);
 
-		expect(stats).toContain("$1.234");
+		expect(stats).toContain("API換算 ≈$1.2340");
 		expect(stats).not.toContain("(sub)");
 	});
 });

@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentEvent, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	fauxAssistantMessage,
@@ -13,6 +13,11 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "../../src/core/extensions/types.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
+import {
+	HARNESS_CHILD_RESULT_ENTRY,
+	HARNESS_CHILD_USAGE_ENTRY,
+	sessionApiEquivalentCost,
+} from "../../src/personal-harness/api-equivalent-cost.ts";
 import {
 	createPersonalHarnessExtension,
 	type PersonalHarnessExtensionOptions,
@@ -42,6 +47,17 @@ function resultText(harness: Harness, name: string): string[] {
 	return harness.session.messages
 		.filter((message) => message.role === "toolResult" && message.toolName === name)
 		.map(getMessageText);
+}
+
+function assistantMessageWithCost(total: number): AssistantMessage {
+	const message = fauxAssistantMessage("Child model response");
+	return {
+		...message,
+		usage: {
+			...message.usage,
+			cost: { input: total, output: 0, cacheRead: 0, cacheWrite: 0, total },
+		},
+	};
 }
 
 describe("personal harness extension in an AgentSession", () => {
@@ -172,6 +188,305 @@ describe("personal harness extension in an AgentSession", () => {
 		const results = resultText(harness, "task");
 		expect(JSON.parse(results.at(-2)!)).toMatchObject({ type: "message", message: { id, text: intermediate } });
 		expect(JSON.parse(results.at(-1)!)).toMatchObject({ id, text: finalText });
+	});
+
+	it("persists completed child model usage before the child job finishes and counts its final result once", async () => {
+		const childGate = Promise.withResolvers<void>();
+		const childListeners: Array<(event: AgentEvent) => void> = [];
+		const harness = await create(
+			dataDirectory(),
+			{},
+			{
+				createSubagentSession: async () => ({
+					prompt: async () => childGate.promise,
+					send: async () => {},
+					abort: async () => childGate.resolve(),
+					dispose: async () => {},
+					getLastAssistantText: () => "child fixture complete",
+					subscribe: (listener) => {
+						childListeners.push(listener);
+						return () => {};
+					},
+				}),
+			},
+		);
+		try {
+			harness.setResponses([
+				fauxAssistantMessage(
+					[
+						fauxToolCall("task", {
+							action: "spawn",
+							task: "Report fixture",
+							provider: "fixture",
+							model: "fixture",
+							thinking: "off",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("Started."),
+			]);
+			await harness.session.prompt("Start the child fixture");
+			const childId = JSON.parse(resultText(harness, "task")[0]).id as string;
+			// Faux reports token estimates without price provenance; keep that parent uncertainty.
+			const parentCost = sessionApiEquivalentCost(harness.sessionManager.getEntries());
+			expect(parentCost.unknownCalls).toBe(2);
+			await vi.waitFor(() => expect(childListeners).toHaveLength(1));
+			const emit = childListeners[0];
+			if (!emit) throw new Error("Child event listener was not installed");
+
+			emit({ type: "message_end", message: assistantMessageWithCost(0.42) });
+			await vi.waitFor(() =>
+				expect(
+					harness.sessionManager
+						.getBranch()
+						.some((entry) => entry.type === "custom" && entry.customType === HARNESS_CHILD_USAGE_ENTRY),
+				).toBe(true),
+			);
+			const branchBeforeCompletion = harness.sessionManager.getBranch();
+			expect(
+				branchBeforeCompletion.some(
+					(entry) => entry.type === "custom" && entry.customType === HARNESS_CHILD_RESULT_ENTRY,
+				),
+			).toBe(false);
+			expect(
+				branchBeforeCompletion.find(
+					(entry) => entry.type === "custom" && entry.customType === HARNESS_CHILD_USAGE_ENTRY,
+				),
+			).toMatchObject({
+				data: { id: childId, apiEquivalentCost: { estimatedUsd: 0.42, unknownCalls: 0 } },
+			});
+			expect(sessionApiEquivalentCost(harness.sessionManager.getEntries())).toEqual({
+				estimatedUsd: 0.42,
+				unknownCalls: parentCost.unknownCalls,
+			});
+
+			childGate.resolve();
+			await vi.waitFor(() =>
+				expect(
+					harness.sessionManager
+						.getBranch()
+						.some((entry) => entry.type === "custom" && entry.customType === HARNESS_CHILD_RESULT_ENTRY),
+				).toBe(true),
+			);
+			expect(sessionApiEquivalentCost(harness.sessionManager.getEntries())).toEqual({
+				estimatedUsd: 0.42,
+				unknownCalls: parentCost.unknownCalls,
+			});
+		} finally {
+			childGate.resolve();
+		}
+	});
+
+	it("preserves Code Mode state and a running child when tree navigation is cancelled", async () => {
+		const childGate = Promise.withResolvers<void>();
+		let abortCalls = 0;
+		const harness = await create(
+			dataDirectory(),
+			{
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_tree", () => ({ cancel: true }));
+					},
+				],
+			},
+			{
+				createSubagentSession: async () => ({
+					prompt: async () => childGate.promise,
+					send: async () => {},
+					abort: async () => {
+						abortCalls++;
+						childGate.resolve();
+					},
+					dispose: async () => {},
+					getLastAssistantText: () => "child fixture completed after cancellation",
+					subscribe: () => () => {},
+				}),
+			},
+		);
+		try {
+			harness.setResponses([
+				fauxAssistantMessage(
+					[
+						fauxToolCall("eval", {
+							language: "javascript",
+							code: "const retainedValue = 42; display(retainedValue);",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("State prepared."),
+			]);
+			await harness.session.prompt("Prepare persistent Code Mode state");
+			const priorUser = harness.sessionManager
+				.getBranch()
+				.find((entry) => entry.type === "message" && entry.message.role === "user");
+			if (!priorUser) throw new Error("Prior user entry was not persisted");
+
+			harness.setResponses([
+				fauxAssistantMessage(
+					[
+						fauxToolCall("task", {
+							action: "spawn",
+							task: "Wait for the parent fixture",
+							provider: "fixture",
+							model: "fixture",
+							thinking: "off",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("Child started."),
+			]);
+			await harness.session.prompt("Start a child that stays active");
+			const childId = JSON.parse(resultText(harness, "task").at(-1)!).id as string;
+
+			expect(await harness.session.navigateTree(priorUser.id, { summarize: false })).toMatchObject({
+				cancelled: true,
+			});
+			expect(abortCalls).toBe(0);
+
+			harness.setResponses([
+				fauxAssistantMessage(
+					[
+						fauxToolCall("eval", {
+							language: "javascript",
+							code: "display(typeof retainedValue + ':' + retainedValue);",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("State survived."),
+			]);
+			await harness.session.prompt("Confirm the retained state after cancellation");
+			expect(resultText(harness, "eval").at(-1)).toContain("number:42");
+
+			childGate.resolve();
+			await vi.waitFor(() => {
+				expect(
+					harness.sessionManager
+						.getBranch()
+						.find(
+							(entry) =>
+								entry.type === "custom" &&
+								entry.customType === HARNESS_CHILD_RESULT_ENTRY &&
+								typeof entry.data === "object" &&
+								entry.data !== null &&
+								"id" in entry.data &&
+								entry.data.id === childId,
+						),
+				).toMatchObject({ data: { status: "completed" } });
+			});
+			expect(abortCalls).toBe(0);
+		} finally {
+			childGate.resolve();
+		}
+	});
+
+	it("persists abort-time child usage on the old branch, not the newly selected one", async () => {
+		const childGate = Promise.withResolvers<void>();
+		const childListeners: Array<(event: AgentEvent) => void> = [];
+		let abortCalls = 0;
+		const harness = await create(
+			dataDirectory(),
+			{},
+			{
+				createSubagentSession: async () => ({
+					prompt: async () => childGate.promise,
+					send: async () => {},
+					abort: async () => {
+						abortCalls++;
+						childListeners[0]?.({ type: "message_end", message: assistantMessageWithCost(0.9) });
+						childGate.resolve();
+					},
+					dispose: async () => {},
+					getLastAssistantText: () => "cancelled child",
+					subscribe: (listener) => {
+						childListeners.push(listener);
+						return () => {};
+					},
+				}),
+			},
+		);
+		try {
+			harness.setResponses([fauxAssistantMessage("Create an earlier branch point.")]);
+			await harness.session.prompt("Create the branch point");
+			const priorUser = harness.sessionManager
+				.getBranch()
+				.find((entry) => entry.type === "message" && entry.message.role === "user");
+			if (!priorUser) throw new Error("Prior user entry was not persisted");
+
+			harness.setResponses([
+				fauxAssistantMessage(
+					[
+						fauxToolCall("task", {
+							action: "spawn",
+							task: "Remain active until navigation",
+							provider: "fixture",
+							model: "fixture",
+							thinking: "off",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("Child started."),
+			]);
+			await harness.session.prompt("Start a child before switching branches");
+			const childId = JSON.parse(resultText(harness, "task").at(-1)!).id as string;
+			const parentCost = sessionApiEquivalentCost(harness.sessionManager.getEntries());
+
+			await vi.waitFor(() => expect(childListeners).toHaveLength(1));
+			const emit = childListeners[0];
+			if (!emit) throw new Error("Child event listener was not installed");
+			emit({ type: "message_end", message: assistantMessageWithCost(0.21) });
+			await vi.waitFor(() =>
+				expect(
+					harness.sessionManager
+						.getBranch()
+						.some((entry) => entry.type === "custom" && entry.customType === HARNESS_CHILD_USAGE_ENTRY),
+				).toBe(true),
+			);
+			const oldLeafId = harness.sessionManager.getLeafId();
+			if (!oldLeafId) throw new Error("Old branch leaf was not available");
+
+			expect(await harness.session.navigateTree(priorUser.id, { summarize: false })).toMatchObject({
+				cancelled: false,
+			});
+			expect(abortCalls).toBe(1);
+			const entries = harness.sessionManager.getEntries();
+			const childCostEntries = entries.filter(
+				(entry) =>
+					entry.type === "custom" &&
+					(entry.customType === HARNESS_CHILD_USAGE_ENTRY || entry.customType === HARNESS_CHILD_RESULT_ENTRY) &&
+					typeof entry.data === "object" &&
+					entry.data !== null &&
+					"id" in entry.data &&
+					entry.data.id === childId,
+			);
+			const childUsageEntries = childCostEntries.filter(
+				(entry) => entry.type === "custom" && entry.customType === HARNESS_CHILD_USAGE_ENTRY,
+			);
+			expect(childUsageEntries).toHaveLength(2);
+			expect(childUsageEntries.at(-1)).toMatchObject({
+				parentId: oldLeafId,
+				data: { id: childId, apiEquivalentCost: { estimatedUsd: 1.11, unknownCalls: 0 } },
+			});
+			expect(
+				childCostEntries.filter(
+					(entry) => entry.type === "custom" && entry.customType === HARNESS_CHILD_RESULT_ENTRY,
+				),
+			).toHaveLength(0);
+			const activeBranch = harness.sessionManager.getBranch();
+			const activeEntryIds = new Set(activeBranch.map((entry) => entry.id));
+			expect(childCostEntries.some((entry) => activeEntryIds.has(entry.id))).toBe(false);
+			expect(sessionApiEquivalentCost(entries)).toEqual({
+				estimatedUsd: parentCost.estimatedUsd + 1.11,
+				unknownCalls: parentCost.unknownCalls,
+			});
+			expect(sessionApiEquivalentCost(activeBranch)).toEqual({ estimatedUsd: 0, unknownCalls: 0 });
+		} finally {
+			childGate.resolve();
+		}
 	});
 
 	it("routes intermediate child messages and replies through the task tool", async () => {
