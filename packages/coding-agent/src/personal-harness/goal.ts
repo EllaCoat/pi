@@ -6,11 +6,12 @@ export interface HarnessGoalSnapshot {
 	version: 1;
 	id: string;
 	objective: string;
-	status: "active" | "paused" | "budget-limited" | "complete" | "dropped";
+	status: "active" | "blocked" | "paused" | "budget-limited" | "complete" | "dropped";
 	createdAt: number;
 	updatedAt: number;
 	tokensUsed: number;
 	tokenBudget?: number;
+	blockReason?: string;
 }
 
 /** A goal records intent and budget; it never grants tool permissions. */
@@ -27,7 +28,7 @@ export class HarnessGoalStore {
 	}
 
 	create(objective: string, tokenBudget?: number): HarnessGoalSnapshot {
-		if (this.#snapshot && ["active", "paused", "budget-limited"].includes(this.#snapshot.status))
+		if (this.#snapshot && ["active", "blocked", "paused", "budget-limited"].includes(this.#snapshot.status))
 			throw new Error("An unfinished goal already exists");
 		if (!objective.trim()) throw new Error("Goal objective is required");
 		if (tokenBudget !== undefined && (!Number.isSafeInteger(tokenBudget) || tokenBudget <= 0))
@@ -45,6 +46,22 @@ export class HarnessGoalStore {
 		});
 	}
 
+	block(reason: string): HarnessGoalSnapshot {
+		if (!this.#snapshot) throw new Error("No goal exists");
+		if (this.#snapshot.status === "complete" || this.#snapshot.status === "dropped")
+			throw new Error("The goal is already finished");
+		if (!reason.trim()) throw new Error("A block reason is required");
+		return this.#commit({ ...this.#snapshot, status: "blocked", blockReason: reason.trim(), updatedAt: Date.now() });
+	}
+
+	edit(objective: string): HarnessGoalSnapshot {
+		if (!this.#snapshot) throw new Error("No goal exists");
+		if (this.#snapshot.status === "complete" || this.#snapshot.status === "dropped")
+			throw new Error("The goal is already finished");
+		if (!objective.trim()) throw new Error("Goal objective is required");
+		return this.#commit({ ...this.#snapshot, objective, updatedAt: Date.now() });
+	}
+
 	transition(status: "paused" | "active" | "complete" | "dropped"): HarnessGoalSnapshot {
 		if (!this.#snapshot) throw new Error("No goal exists");
 		if (this.#snapshot.status === "complete" || this.#snapshot.status === "dropped")
@@ -55,7 +72,9 @@ export class HarnessGoalStore {
 			this.#snapshot.tokensUsed >= this.#snapshot.tokenBudget
 		)
 			throw new Error("Goal budget is exhausted; change it explicitly before resuming");
-		return this.#commit({ ...this.#snapshot, status, updatedAt: Date.now() });
+		const next = { ...this.#snapshot, status, updatedAt: Date.now() };
+		delete next.blockReason;
+		return this.#commit(next);
 	}
 
 	setBudget(tokenBudget: number | undefined): HarnessGoalSnapshot {
@@ -86,7 +105,7 @@ export class HarnessGoalStore {
 			typeof data.id !== "string" ||
 			typeof data.objective !== "string" ||
 			typeof data.status !== "string" ||
-			!["active", "paused", "budget-limited", "complete", "dropped"].includes(data.status)
+			!["active", "blocked", "paused", "budget-limited", "complete", "dropped"].includes(data.status)
 		)
 			return false;
 		if (
@@ -104,6 +123,7 @@ export class HarnessGoalStore {
 			(typeof data.tokenBudget !== "number" || !Number.isSafeInteger(data.tokenBudget) || data.tokenBudget <= 0)
 		)
 			return false;
+		if (data.status === "blocked" && (typeof data.blockReason !== "string" || !data.blockReason.trim())) return false;
 		this.#snapshot = {
 			version: 1,
 			id: data.id,
@@ -113,6 +133,9 @@ export class HarnessGoalStore {
 			updatedAt: data.updatedAt,
 			tokensUsed: data.tokensUsed,
 			...(typeof data.tokenBudget === "number" ? { tokenBudget: data.tokenBudget } : {}),
+			...(data.status === "blocked" && typeof data.blockReason === "string"
+				? { blockReason: data.blockReason }
+				: {}),
 		};
 		return true;
 	}

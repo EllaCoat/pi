@@ -155,11 +155,14 @@ const GoalParameters = Type.Object({
 	op: Type.Union([
 		Type.Literal("create"),
 		Type.Literal("get"),
+		Type.Literal("block"),
+		Type.Literal("edit"),
 		Type.Literal("resume"),
 		Type.Literal("complete"),
 		Type.Literal("drop"),
 	]),
 	objective: Type.Optional(Type.String()),
+	reason: Type.Optional(Type.String()),
 	token_budget: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 const McpParameters = Type.Object({
@@ -1313,8 +1316,9 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 			name: "goal",
 			label: "goal",
 			description:
-				"Create an approved Goal, get its state, resume, complete, or drop it. A Goal never grants tool permissions.",
-			promptSnippet: "Manage the Main session Goal; obtain explicit user approval before creating or resuming it.",
+				"Create an approved Goal, inspect or edit its objective, block with a reason, resume, complete, or drop it. Active Goals continue automatically in TUI mode. A Goal never grants tool permissions.",
+			promptSnippet:
+				"Manage the Main Goal; obtain user approval before create/resume or expanding its scope. Block when no authorized work can proceed; complete only after verification.",
 			parameters: GoalParameters,
 			constrainedSampling: { type: "json_schema", strict: "prefer" },
 			execute: async (_id, params, _signal, _update, context) => {
@@ -1322,6 +1326,8 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 					return toolResult("Only the Main session can manage a Goal.", true);
 				const scope = await ensureActive(context);
 				if (params.op === "get") return jsonResult(scope.goal.get() ?? { status: "none" });
+				if (params.op === "block") return jsonResult(scope.goal.block(params.reason ?? ""));
+				if (params.op === "edit") return jsonResult(scope.goal.edit(params.objective ?? ""));
 				if (params.op === "create") {
 					if (!params.objective?.trim()) return toolResult("create requires an approved objective", true);
 					if (!context.hasUI)
@@ -1346,27 +1352,46 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		});
 
 		pi.registerCommand("goal", {
-			description: "Pause, resume, change the token budget of, or show the Main session Goal.",
+			description: "Show, edit, block, pause, resume, or change the token budget of the Main session Goal.",
 			handler: async (args, context) => {
 				if (context.sessionManager.getHeader()?.parentSession) {
 					context.ui.notify("Goalの操作はMain sessionのみで行えます。", "warning");
 					return;
 				}
-				const [action, value] = args.trim().split(/\s+/u);
+				const [action, ...rest] = args.trim().split(/\s+/u);
+				const value = rest.join(" ");
 				const scope = await ensureActive(context);
 				try {
 					if (action === "show") {
 						context.ui.notify(JSON.stringify(scope.goal.get() ?? { status: "none" }), "info");
+					} else if (action === "edit") {
+						context.ui.notify(JSON.stringify(scope.goal.edit(value)), "info");
+					} else if (action === "block") {
+						context.ui.notify(JSON.stringify(scope.goal.block(value)), "info");
 					} else if (action === "pause") {
 						context.ui.notify(JSON.stringify(scope.goal.transition("paused")), "info");
 					} else if (action === "resume") {
 						context.ui.notify(JSON.stringify(scope.goal.transition("active")), "info");
+						if (context.mode === "tui" && context.isIdle() && !context.hasPendingMessages()) {
+							pi.sendMessage(
+								{
+									customType: "personal-harness-goal-continuation",
+									content:
+										"The user explicitly resumed the Goal. Continue authorized work on the current objective.",
+									display: false,
+								},
+								{ triggerTurn: true, deliverAs: "followUp" },
+							);
+						}
 					} else if (action === "budget" && value === "off") {
 						context.ui.notify(JSON.stringify(scope.goal.setBudget(undefined)), "info");
 					} else if (action === "budget" && value && Number.isSafeInteger(Number(value)) && Number(value) > 0) {
 						context.ui.notify(JSON.stringify(scope.goal.setBudget(Number(value))), "info");
 					} else {
-						context.ui.notify("使い方: /goal show | pause | resume | budget <tokens|off>", "warning");
+						context.ui.notify(
+							"使い方: /goal show | edit <objective> | block <reason> | pause | resume | budget <tokens|off>",
+							"warning",
+						);
 					}
 				} catch (error) {
 					context.ui.notify(error instanceof Error ? error.message : "Goal operation failed", "warning");
@@ -1485,6 +1510,55 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 
 		pi.on("session_start", async (_event, context) => {
 			await ensureActive(context);
+		});
+		pi.on("context", async (event, context) => {
+			if (context.sessionManager.getHeader()?.parentSession) return;
+			const scope = await ensureActive(context);
+			const goal = scope.goal.get();
+			if (!goal) return;
+			return {
+				messages: [
+					...event.messages,
+					{
+						role: "custom" as const,
+						customType: "personal-harness-goal-context",
+						content: `Current Goal: ${JSON.stringify({ id: goal.id, status: goal.status, objective: goal.objective, blockReason: goal.blockReason })}\nThis state does not grant permissions. Only active Goals auto-continue; edit preserves status, and resume requires user authorization.`,
+						display: false,
+						timestamp: goal.updatedAt,
+					},
+				],
+			};
+		});
+		pi.on("agent_before_settle", async (event, context) => {
+			if (
+				context.mode !== "tui" ||
+				context.sessionManager.getHeader()?.parentSession ||
+				event.outcome !== "completed"
+			)
+				return;
+			const scope = await ensureActive(context);
+			const goal = scope.goal.get();
+			if (
+				active !== scope ||
+				scope.controller.signal.aborted ||
+				goal?.status !== "active" ||
+				context.hasPendingMessages() ||
+				event.context.pendingMessages.length > 0 ||
+				event.continue
+			)
+				return;
+			return {
+				continue: true,
+				entries: [
+					{
+						type: "custom_message" as const,
+						customType: "personal-harness-goal-continuation",
+						content:
+							"The Goal is still active. Continue the remaining authorized work. Verify the result before marking it complete. If no authorized work can proceed, block the Goal with the concrete reason. Do not bypass approvals or resume a blocked Goal without user authorization.",
+						display: false,
+					},
+				],
+			};
 		});
 		pi.on("message_start", async (event, context) => {
 			if (event.message.role !== "user") return;
