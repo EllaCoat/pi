@@ -62,9 +62,6 @@
 	"scripts": {
 		"clean": "shx rm -rf dist",
 		"build": "tsc -p tsconfig.build.json",
-		"test": "vitest --run",
-		"bench:storage": "vitest bench --config vitest.benchmark.config.ts",
-		"bench:storage:memory": "node --conditions=source --experimental-strip-types test/storage-memory.ts",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"keywords": [

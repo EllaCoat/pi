@@ -51,33 +51,9 @@ registerStorageConformance({ describe, expect, it }, "Some Custom Storage", asyn
 
 The provider must call and await `use` exactly once with isolated storage. Other runners can use `createStorageConformance` with their own `StorageConformanceAssertions` implementation.
 
-## Storage benchmarks
+## Storage workload definitions
 
-From this package directory:
-
-```sh
-npm run bench:storage
-npm run bench:storage:memory
-```
-
-The timing suite runs shared deterministic workloads against the built-in memory, JSONL, and SQLite adapters. Third-party adapters can import the same seeds and workload definitions from `@earendil-works/pi-durable/testing` and use their platform's timing runner:
-
-```ts
-import {
-	seedStorageBenchmark,
-	seedStorageWriteBenchmark,
-	STORAGE_READ_BENCHMARKS,
-	STORAGE_WRITE_BENCHMARKS,
-} from "@earendil-works/pi-durable/testing";
-
-const dataset = await seedStorageBenchmark(readStorage);
-await STORAGE_READ_BENCHMARKS[0].run(readStorage, dataset);
-
-await seedStorageWriteBenchmark(freshWriteStorage);
-await STORAGE_WRITE_BENCHMARKS[0].run(freshWriteStorage);
-```
-
-Read scenarios reuse one seeded store; each write sample requires a fresh seeded store. The workloads cover representative commits, indexed reads, pagination, fork traversal, document replay, historical reads, and persistent-backend reopen. The footprint suite measures each built-in adapter in a separate process at 1k and 10k scales and reports heap, RSS, external memory, file counts, and on-disk JSONL/SQLite size. These synthetic workloads are baselines for regression analysis, not production capacity limits or CI pass/fail thresholds.
+`@earendil-works/pi-durable/testing` still exports synthetic workload seeds for independent adapter tests. This repository no longer ships a first-party storage benchmark runner; timed measurements are not part of the R1–R10 acceptance checks.
 
 The normative design and implementation sequence are in:
 

@@ -305,9 +305,9 @@ document plus copy. That is an inference from measured clone sizes, not a rerun
 of the complete historical baseline. The improvement does not address gigabytes
 of proxy bookkeeping during traversal.
 
-## Retained reproduction and provenance
+## Historical reproduction and provenance
 
-From the repository root:
+The following is the historical reproduction command used when these measurements were collected. The benchmark implementation and test files were later retired for the current R1–R10 scope; treat this block as provenance, not as a supported current procedure.
 
 ```sh
 node --expose-gc packages/chord/test/delta-traversal.bench.ts --quick --out /tmp/delta-traversal-quick.json
@@ -315,12 +315,9 @@ node --expose-gc packages/chord/test/delta-traversal.bench.ts --out /tmp/delta-t
 node --expose-gc packages/chord/test/delta-traversal.bench.ts --modes delta --out /tmp/delta-only.json
 ```
 
-The retained benchmark supports raw, minimal-proxy, and current tree-delta modes.
-It checks traversal results, uses separate processes, records source hashes, and
-allows multiple event-loop/GC turns. It no longer contains the removed graph
-implementation or reproduces the historical graph/mutation comparison.
+At the time, the benchmark supported raw, minimal-proxy, and current tree-delta modes. It checked traversal results, used separate processes, recorded source hashes, and allowed multiple event-loop/GC turns. It did not contain the removed graph implementation or reproduce the historical graph/mutation comparison.
 
-Targeted tests from `packages/chord`:
+Historical targeted test command (the referenced test set is no longer maintained):
 
 ```sh
 node ../../node_modules/vitest/dist/cli.js --run test/delta.test.ts test/delta-clone.test.ts test/delta-tracker/retention.test.ts test/services.test.ts test/service-wire.test.ts test/facets.test.ts

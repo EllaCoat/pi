@@ -1,6 +1,7 @@
 # WP08 — Named-branch and tree forks with streaming copies
 
 **Status: in progress — implementing Slice C.**
+**Personal-harness fork scope:** This is an upstream work-package record, not the current Axia-Pi acceptance checklist. Axia-Pi retains tests for its interactive harness, provider connections, tool execution, memory, Goals, compaction, and TODO behavior. Benchmarks and correctness tests for the alternative agent-harness/storage backends have been retired from this fork; those references below are historical. The fork/storage implementations themselves are unchanged by this test reduction.
 
 This package replaces the fork contract: `ForkOptions` gains a mandatory scope and a mandatory named source branch, branch forks validate a complete configured source AgentLane and ancestry membership, tree forks copy the complete immutable tree plus current application values/lists, and all three backends replace materialized source snapshot arrays with bounded-memory streaming copies. A JSONL fork never repairs or mutates its source. One closed core classifier owns every namespace's fork disposition.
 
@@ -18,7 +19,7 @@ Read completely before editing:
 6. `packages/agent/src/harness/session/jsonl/repo.ts`, `jsonl/storage.ts`, `jsonl/codec.ts`, `jsonl/legacy-v3.ts`, `jsonl/types.ts`.
 7. `packages/session-backends/sqlite-node/src/sqlite/repo.ts`, `storage.ts`, `session/values.ts`, `session/entries.ts`, `session/branch-entries.ts`, `types.ts`.
 8. `packages/agent/src/harness/session/testing/conformance/session-repo.ts` and every test named in §5.
-9. `packages/agent/src/harness/session/testing/benchmark/session-repo.ts` and both `session-repo.bench.ts` files.
+9. The earlier package benchmark runners were retired under Goal 15905 and are not implementation inputs or required outputs for this goal.
 
 Do not use `dist/` output as implementation input. WP00–WP07 documents and released changelog sections are immutable in this package.
 
@@ -120,7 +121,7 @@ Destination id reservation across create/open/fork/delete, no-create opens, fore
 3. Streaming procedures of §1.3 on all three backends; `createForkSnapshot`/`captureForkSource`/`snapshot()` fork plumbing and their exports removed from `session/index.ts` and the sqlite-node import surface.
 4. Valid destination-local sequence allocation on every backend; identical logical destination state across backends for identical sources (conformance).
 5. JSONL source non-mutation, including torn-tail sources and legacy v3 sources.
-6. Documentation: `harness.md` §2.7 (and the §1.7 fork-related sentences), `values.md` "Forks and rewrites" and backend snapshot mentions, `post-wp05-roadmap.md` (retire the SQLite fork-cost item, add/point to this package), `packages/session-backends/sqlite-node/README.md` fork paragraphs, `packages/agent/benchmark/session/README.md` if dataset wording changes. Historical WP docs and released changelogs untouched. Format/storage versions unchanged; no migration.
+6. Documentation: `harness.md` §2.7 (and the §1.7 fork-related sentences), `values.md` "Forks and rewrites" and backend snapshot mentions, `post-wp05-roadmap.md` (retire the SQLite fork-cost item, add/point to this package), and `packages/session-backends/sqlite-node/README.md` fork paragraphs. Historical WP docs and released changelogs untouched. Format/storage versions unchanged; no migration.
 
 ## 4. Implementation slices
 
@@ -149,11 +150,11 @@ Files: `sqlite/repo.ts`, `sqlite/storage.ts`, `sqlite/session/values.ts`, `sqlit
 2. Branch ancestry/membership/labels through the branch index; classifier-matching SQL prefilters.
 3. Preserve WP07 identity, reservation, no-create, and close coverage; both layouts.
 
-### Slice D — benchmarks and documentation
+### Slice D — documentation (benchmark deliverables retired)
 
-Files: `testing/benchmark/session-repo.ts`, both `session-repo.bench.ts` files, `benchmark/session/README.md`, `harness.md`, `values.md`, `post-wp05-roadmap.md`, sqlite-node `README.md`, changelogs only under normal branch rules.
+Files: `harness.md`, `values.md`, `post-wp05-roadmap.md`, sqlite-node `README.md`, changelogs only under normal branch rules.
 
-Update fork option literals, add large-source fork benchmarks (tree and branch), and land the §3.6 documentation set.
+Update fork option literals and land the §3.6 documentation set. Do not add or restore performance benchmarks as part of Goal 15905.
 
 ## 5. Required tests
 

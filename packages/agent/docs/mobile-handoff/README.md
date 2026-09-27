@@ -71,10 +71,9 @@ once `retireScope` replaces the per-address deletes. That is the change landing.
 
 - Node 22+ for every shipped `.ts` file. They run under
   `node --experimental-strip-types` with no build step and no dependencies.
-- In the pi repo, tests run from the package:
-  `cd packages/agent && npx vitest run --config vitest.harness.config.ts`.
-  The root vitest config does **not** alias `@earendil-works/pi-ai`; the
-  per-package harness config does.
+- Historical package test command: `cd packages/agent && npx vitest run --config vitest.harness.config.ts`.
+  That alternative-harness test runner has been retired from the Axia-Pi fork;
+  this archived design is not its current test acceptance checklist.
 - Typecheck with `npx tsgo --noEmit` from the repo root. **Baseline is ~788
   pre-existing errors**, almost all in `packages/ai/test`. Count only:
   `grep "error TS" | grep -E "packages/(agent|session-backends)/src"`.

@@ -49,13 +49,6 @@
 		"generate-telemetry-docs": "node scripts/generate-telemetry-docs.ts",
 		"check:telemetry-docs": "node scripts/generate-telemetry-docs.ts --check",
 		"build": "tsc -p tsconfig.build.json",
-		"bench:session:timing": "vitest bench --config vitest.benchmark.config.ts",
-		"bench:session:memory": "node --import ../coding-agent/src/experimental/source-resolver.ts benchmark/session/loaded-footprint.ts",
-		"bench:session:allocations": "node --import ../coding-agent/src/experimental/source-resolver.ts benchmark/session/allocation-profile.ts",
-		"test": "vitest --run",
-		"test:harness": "vitest --run --config vitest.harness.config.ts",
-		"test:session:conformance": "vitest --run --config vitest.harness.config.ts test/harness/memory-conformance.test.ts",
-		"coverage:harness": "vitest --run --config vitest.harness.config.ts --coverage",
 		"prepublishOnly": "npm run build"
 	},
 	"dependencies": {

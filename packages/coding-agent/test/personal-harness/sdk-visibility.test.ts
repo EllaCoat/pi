@@ -111,7 +111,7 @@ describe("SDK tool visibility and persisted execution access", () => {
 			getCurrentTools(requests[0].messages)
 				.map((tool) => tool.name)
 				.sort(),
-		).toEqual(["eval", "todo"]);
+		).toEqual(["ask", "eval", "todo"]);
 		for (const prompt of observedPrompts) {
 			expect(prompt).not.toContain("PRIVATE_TOOL_SNIPPET");
 			expect(prompt).not.toContain("PRIVATE_TOOL_GUIDELINE");

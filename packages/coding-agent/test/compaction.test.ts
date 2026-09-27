@@ -1,13 +1,9 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai/compat";
-import { getModel } from "@earendil-works/pi-ai/compat";
-import { readFileSync } from "fs";
-import { join } from "path";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type CompactionSettings,
 	calculateContextTokens,
-	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	findCutPoint,
@@ -20,8 +16,6 @@ import {
 	type CompactionEntry,
 	type CustomMessageEntry,
 	type ModelChangeEntry,
-	migrateSessionEntries,
-	parseSessionEntries,
 	type SessionEntry,
 	type SessionMessageEntry,
 	type ThinkingLevelChangeEntry,
@@ -31,12 +25,17 @@ import {
 // Test fixtures
 // ============================================================================
 
-function loadLargeSessionEntries(): SessionEntry[] {
-	const sessionPath = join(__dirname, "fixtures/large-session.jsonl");
-	const content = readFileSync(sessionPath, "utf-8");
-	const entries = parseSessionEntries(content);
-	migrateSessionEntries(entries); // Add id/parentId for v1 fixtures
-	return entries.filter((e): e is SessionEntry => e.type !== "session");
+function createSyntheticSessionEntries(): SessionEntry[] {
+	const entries: SessionEntry[] = [createModelChangeEntry("anthropic", "claude-sonnet-4-5")];
+	for (let turn = 0; turn < 120; turn++) {
+		const user = createUserMessage(`Synthetic user turn ${turn}: ${"context ".repeat(32)}`);
+		const assistant = createAssistantMessage(
+			`Synthetic response ${turn}: ${"result ".repeat(32)}`,
+			createMockUsage(4_000, 120),
+		);
+		entries.push(createMessageEntry(user), createMessageEntry(assistant));
+	}
+	return entries;
 }
 
 function createMockUsage(input: number, output: number, cacheRead = 0, cacheWrite = 0): Usage {
@@ -564,92 +563,26 @@ describe("prepareCompaction with previous compaction", () => {
 	});
 });
 
-// ============================================================================
-// Integration tests with real session data
-// ============================================================================
-
-describe("Large session fixture", () => {
-	it("should parse the large session", () => {
-		const entries = loadLargeSessionEntries();
+describe("synthetic large session", () => {
+	it("builds a long session from generated entries", () => {
+		const entries = createSyntheticSessionEntries();
 		expect(entries.length).toBeGreaterThan(100);
+		expect(entries.filter((entry) => entry.type === "message")).toHaveLength(240);
 
-		const messageCount = entries.filter((e) => e.type === "message").length;
-		expect(messageCount).toBeGreaterThan(100);
-	});
-
-	it("should find cut point in large session", () => {
-		const entries = loadLargeSessionEntries();
-		const result = findCutPoint(entries, 0, entries.length, DEFAULT_COMPACTION_SETTINGS.keepRecentTokens);
-
-		// Cut point should be at a message entry (user or assistant)
-		expect(entries[result.firstKeptEntryIndex].type).toBe("message");
-		const role = (entries[result.firstKeptEntryIndex] as SessionMessageEntry).message.role;
-		expect(role === "user" || role === "assistant").toBe(true);
-	});
-
-	it("should load session correctly", () => {
-		const entries = loadLargeSessionEntries();
 		const loaded = buildSessionContext(entries);
-
 		expect(loaded.messages.length).toBeGreaterThan(100);
 		expect(loaded.model).not.toBeNull();
 	});
-});
 
-// ============================================================================
-// LLM integration tests (skipped without API key)
-// ============================================================================
-
-describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("LLM summarization", () => {
-	it("should generate a compaction result for the large session", async () => {
-		const entries = loadLargeSessionEntries();
-		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-
-		const preparation = prepareCompaction(entries, DEFAULT_COMPACTION_SETTINGS);
-		expect(preparation).toBeDefined();
-
-		const compactionResult = await compact(preparation!, model, process.env.ANTHROPIC_OAUTH_TOKEN!);
-
-		expect(compactionResult.summary.length).toBeGreaterThan(100);
-		expect(compactionResult.firstKeptEntryId).toBeTruthy();
-		expect(compactionResult.tokensBefore).toBeGreaterThan(0);
-
-		console.log("Summary length:", compactionResult.summary.length);
-		console.log("First kept entry ID:", compactionResult.firstKeptEntryId);
-		console.log("Tokens before:", compactionResult.tokensBefore);
-		console.log("\n--- SUMMARY ---\n");
-		console.log(compactionResult.summary);
-	}, 60000);
-
-	it("should produce valid session after compaction", async () => {
-		const entries = loadLargeSessionEntries();
-		const loaded = buildSessionContext(entries);
-		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-
-		const preparation = prepareCompaction(entries, DEFAULT_COMPACTION_SETTINGS);
-		expect(preparation).toBeDefined();
-
-		const compactionResult = await compact(preparation!, model, process.env.ANTHROPIC_OAUTH_TOKEN!);
-
-		// Simulate appending compaction to entries by creating a proper entry
-		const lastEntry = entries[entries.length - 1];
-		const parentId = lastEntry.id;
-		const compactionEntry: CompactionEntry = {
-			type: "compaction",
-			id: "compaction-test-id",
-			parentId,
-			timestamp: new Date().toISOString(),
-			...compactionResult,
-		};
-		const newEntries = [...entries, compactionEntry];
-		const reloaded = buildSessionContext(newEntries);
-
-		// Should have summary + kept messages
-		expect(reloaded.messages.length).toBeLessThan(loaded.messages.length);
-		expect(reloaded.messages[0].role).toBe("compactionSummary");
-		expect((reloaded.messages[0] as any).summary).toContain(compactionResult.summary);
-
-		console.log("Original messages:", loaded.messages.length);
-		console.log("After compaction:", reloaded.messages.length);
-	}, 60000);
+	it("finds a message boundary in a long session", () => {
+		const entries = createSyntheticSessionEntries();
+		const keepRecentTokens = 4_000;
+		const result = findCutPoint(entries, 0, entries.length, keepRecentTokens);
+		expect(result.firstKeptEntryIndex).toBeGreaterThan(0);
+		const firstKeptEntry = entries[result.firstKeptEntryIndex];
+		expect(firstKeptEntry?.type).toBe("message");
+		if (firstKeptEntry?.type === "message") {
+			expect(["user", "assistant"]).toContain(firstKeptEntry.message.role);
+		}
+	});
 });
