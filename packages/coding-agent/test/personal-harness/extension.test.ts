@@ -79,6 +79,39 @@ describe("personal harness extension in an AgentSession", () => {
 		for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
 	});
 
+	it("marks direct and Code Mode web-search failures as tool errors", async () => {
+		const harness = await create(
+			dataDirectory(),
+			{},
+			{ webSearchModel: { provider: "unconfigured-fixture", model: "fixture", thinking: "off" } },
+		);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("web_search", { query: "public fixture" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Search failed."),
+		]);
+		await harness.session.prompt("Try the unconfigured search fixture");
+		expect(
+			harness.session.messages.findLast((m) => m.role === "toolResult" && m.toolName === "web_search"),
+		).toMatchObject({ isError: true });
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("eval", {
+						language: "javascript",
+						code: "await tool.web_search({query:'public fixture'});",
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("Code Mode reports search failure."),
+		]);
+		await harness.session.prompt("Try it through Code Mode");
+		expect(harness.session.messages.findLast((m) => m.role === "toolResult" && m.toolName === "eval")).toMatchObject({
+			isError: false,
+			details: { toolExecutions: [{ name: "web_search", status: "failure" }] },
+		});
+	});
+
 	it("caps both child notifications at 10000 characters while explicit retrieval keeps full text", async () => {
 		const intermediate = "ordinary child update ".repeat(600);
 		const finalText = "ordinary final result ".repeat(600);

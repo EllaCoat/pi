@@ -1,6 +1,6 @@
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 
-export type HarnessUsagePurpose = "main" | "subagent" | "memory" | "compact" | "todo" | "hook";
+export type HarnessUsagePurpose = "main" | "subagent" | "memory" | "compact" | "todo" | "hook" | "web-search";
 export interface HarnessUsageRecord {
 	purpose: HarnessUsagePurpose;
 	model: string;

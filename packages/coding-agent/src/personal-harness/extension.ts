@@ -53,6 +53,7 @@ import {
 } from "./todo/index.ts";
 import { installCodeModeToolSurface } from "./tool-surface.ts";
 import { HarnessUsageLedger, reportedModelUsage } from "./usage.ts";
+import { searchHarnessWeb } from "./web-search.ts";
 
 const MAX_TODO_DELTA_CHARACTERS = 384;
 const MAX_TOOL_DELTA_CHARACTERS = 384;
@@ -63,7 +64,13 @@ const EvalParameters = Type.Object({
 	language: Type.Union([Type.Literal("javascript"), Type.Literal("python")]),
 	code: Type.String({ minLength: 1 }),
 });
-
+const WebSearchParameters = Type.Object({
+	query: Type.String({ minLength: 1 }),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+	recency: Type.Optional(
+		Type.Union([Type.Literal("day"), Type.Literal("week"), Type.Literal("month"), Type.Literal("year")]),
+	),
+});
 const TaskParameters = Type.Object({
 	action: Type.Union([
 		Type.Literal("spawn"),
@@ -224,7 +231,7 @@ export interface PersonalHarnessExtensionOptions {
 	readonly inheritedSkillPaths?: readonly string[];
 	readonly hookValues?: Omit<Partial<HarnessHookOptions>, "evaluate" | "hold" | "ledger">;
 	readonly backgroundTodoModel?: HarnessModelSelection;
-
+	readonly webSearchModel?: HarnessModelSelection;
 	readonly childSystemPrompt?: string;
 	readonly maxParallelChildren?: number;
 	readonly todoDebounceMs?: number;
@@ -1228,6 +1235,29 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		});
 
 		pi.registerTool({
+			name: "web_search",
+			label: "web search",
+			description: "Search the web through the configured Codex model and return an answer with source URLs.",
+			parameters: WebSearchParameters,
+			executionMode: "parallel",
+			execute: async (_id, params, signal, _update, context) => {
+				const scope = await ensureActive(context);
+				try {
+					const result = await searchHarnessWeb(params, {
+						registry: scope.registry,
+						selection: options.webSearchModel ?? { ...LUNA_MAX, thinking: "low" },
+						ledger: usage,
+						signal,
+						sessionId: scope.sessionId,
+					});
+					return jsonResult(result);
+				} catch (error) {
+					return toolResult(error instanceof Error ? error.message : "Web search failed", true);
+				}
+			},
+		});
+
+		pi.registerTool({
 			name: "todo",
 			label: "personal todo",
 			description: "Read or overwrite the session TODO status, including manual completion.",
@@ -1346,7 +1376,9 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 
 		pi.on("tool_result", (event) => {
 			if (
-				["eval", "task", "recall", "memory", "todo", "mcp", "usage", "goal"].includes(event.toolName) &&
+				["eval", "task", "recall", "memory", "todo", "mcp", "web_search", "usage", "goal"].includes(
+					event.toolName,
+				) &&
 				isRecord(event.details) &&
 				(event.details.harnessError === true ||
 					event.details.isError === true ||
