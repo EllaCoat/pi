@@ -1,4 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Model, ModelsApiStreamOptions, ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
 import { type AssistantMessage, type Context, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "../core/model-registry.ts";
 import { type HarnessUsageLedger, type HarnessUsagePurpose, reportedModelUsage } from "./usage.ts";
@@ -7,9 +8,16 @@ export interface HarnessModelSelection {
 	provider: string;
 	model: string;
 	thinking: ThinkingLevel;
+	fast?: boolean;
 }
 
 export const LUNA_MAX: HarnessModelSelection = { provider: "openai-codex", model: "gpt-6-luna", thinking: "max" };
+export const LUNA_HIGH_FAST: HarnessModelSelection = {
+	provider: "openai-codex",
+	model: "gpt-6-luna",
+	thinking: "high",
+	fast: true,
+};
 
 export interface HarnessCompletionOptions {
 	registry: ModelRegistry;
@@ -38,18 +46,33 @@ export async function completeHarnessTask(options: HarnessCompletionOptions): Pr
 		signal.throwIfAborted();
 		const model = registry.find(selection.provider, selection.model);
 		if (!model) throw new Error(`Configured model is unavailable: ${modelName}`);
+		if (selection.fast && model.api !== "openai-codex-responses") {
+			throw new Error(`${modelName} does not support Codex Fast Mode`);
+		}
 		if (!getSupportedThinkingLevels(model).includes(selection.thinking)) {
 			throw new Error(`${modelName} does not support thinking=${selection.thinking}`);
 		}
-		response = await registry
-			.streamSimple(model, options.context, {
-				signal,
+		const commonOptions = {
+			signal,
+			maxTokens: options.maxTokens ?? 8192,
+			cacheRetention: "short" as const,
+			...(options.sessionId ? { sessionId: options.sessionId } : {}),
+		};
+		if (selection.fast) {
+			const codexModel = model as Model<"openai-codex-responses">;
+			const streamOptions: ModelsApiStreamOptions<"openai-codex-responses"> = {
+				...commonOptions,
+				...(selection.thinking === "off" ? {} : { reasoningEffort: selection.thinking }),
+				serviceTier: "priority",
+			};
+			response = await registry.stream(codexModel, options.context, streamOptions).result();
+		} else {
+			const streamOptions: ModelsSimpleStreamOptions = {
+				...commonOptions,
 				...(selection.thinking === "off" ? {} : { reasoning: selection.thinking }),
-				maxTokens: options.maxTokens ?? 8192,
-				cacheRetention: "short",
-				...(options.sessionId ? { sessionId: options.sessionId } : {}),
-			})
-			.result();
+			};
+			response = await registry.streamSimple(model, options.context, streamOptions).result();
+		}
 		signal.throwIfAborted();
 		if (response.stopReason === "error" || response.stopReason === "aborted" || response.stopReason === "length") {
 			throw new Error(response.errorMessage ?? `Model stopped with ${response.stopReason}`);

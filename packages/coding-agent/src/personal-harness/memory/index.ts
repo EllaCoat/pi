@@ -64,14 +64,13 @@ export interface MemoryRecallResult {
 }
 
 const MAX_CURATOR_INPUT_CHARACTERS = 12_000;
-const MAX_CURATED_CHARACTERS = 1_000;
+const MAX_CURATED_CHARACTERS = 5_000;
 
-function citationIsAvailable(citation: MemoryCitation, records: readonly MemoryExcerpt[]): boolean {
+function canonicalCitation(citation: MemoryCitation, records: readonly MemoryExcerpt[]): MemoryCitation | undefined {
 	const range = citation?.range;
-	if (!range || typeof range !== "object" || !Number.isInteger(range.start) || !Number.isInteger(range.end)) {
-		return false;
-	}
-	return records.some(
+	if (!range || typeof range !== "object" || !Number.isInteger(range.start) || !Number.isInteger(range.end))
+		return undefined;
+	const record = records.find(
 		(record) =>
 			record.kind === citation.kind &&
 			record.sessionId === citation.sessionId &&
@@ -82,6 +81,16 @@ function citationIsAvailable(citation: MemoryCitation, records: readonly MemoryE
 			range.end > range.start &&
 			range.end <= record.range.end,
 	);
+	if (!record) return undefined;
+	// The host owns excerpt offsets; generated subranges are not reliable source locations.
+	return {
+		sessionId: record.sessionId,
+		branchId: record.branchId,
+		entryId: record.entryId,
+		sourceRevision: record.sourceRevision,
+		kind: record.kind,
+		range: { ...record.range },
+	};
 }
 
 function renderExcerpts(records: readonly MemoryExcerpt[]): string {
@@ -198,8 +207,11 @@ export class PersonalMemoryStore {
 		if (typeof curated?.text !== "string" || !Array.isArray(curated.citations) || curated.citations.length === 0) {
 			return this.#excerptResult(search, "invalid-citations");
 		}
-		if (curated.citations.some((citation) => !citationIsAvailable(citation, search.candidates))) {
-			return this.#excerptResult(search, "invalid-citations");
+		const citations: MemoryCitation[] = [];
+		for (const citation of curated.citations) {
+			const canonical = canonicalCitation(citation, search.candidates);
+			if (!canonical) return this.#excerptResult(search, "invalid-citations");
+			citations.push(canonical);
 		}
 
 		const text = redactSensitiveText(curated.text).text;
@@ -213,8 +225,8 @@ export class PersonalMemoryStore {
 			reason: "curated",
 			query: search.query,
 			content: text,
-			citations: curated.citations,
-			records: search.candidates,
+			citations,
+			records: [],
 			generation: search.generation,
 			...(search.nextOffset !== undefined ? { nextOffset: search.nextOffset } : {}),
 		};

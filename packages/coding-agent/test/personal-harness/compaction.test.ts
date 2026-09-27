@@ -10,7 +10,12 @@ import type {
 	SessionCompactFailedEvent,
 } from "../../src/core/extensions/types.ts";
 import { installModelCompactionHook } from "../../src/personal-harness/hooks/compaction.ts";
-import { completeHarnessTask, harnessResponseText, LUNA_MAX } from "../../src/personal-harness/model-call.ts";
+import {
+	completeHarnessTask,
+	type HarnessModelSelection,
+	harnessResponseText,
+	LUNA_MAX,
+} from "../../src/personal-harness/model-call.ts";
 import { HarnessUsageLedger } from "../../src/personal-harness/usage.ts";
 import { createHarness, type Harness } from "../suite/harness.ts";
 
@@ -27,7 +32,7 @@ type CompactionHandler = (
 ) => Promise<SessionBeforeCompactResult | undefined>;
 type TerminalHandler = (event: SessionCompactEvent | SessionCompactFailedEvent, context: ExtensionContext) => void;
 
-function setup() {
+function setup(compactModel?: HarnessModelSelection) {
 	const handlers = new Map<string, StoredHandler[]>();
 	const pi = {
 		on(name: string, handler: StoredHandler) {
@@ -51,7 +56,7 @@ function setup() {
 		ui: { notify },
 		sessionManager: { getSessionId: () => "session-1" },
 	} as unknown as ExtensionContext;
-	installModelCompactionHook(pi, { hold, ledger: new HarnessUsageLedger() });
+	installModelCompactionHook(pi, { hold, ledger: new HarnessUsageLedger(), compactModel });
 	return {
 		handlers,
 		hold,
@@ -68,14 +73,16 @@ function event(): SessionBeforeCompactEvent {
 		type: "session_before_compact",
 		preparation: {
 			firstKeptEntryId: "kept-1",
-			messagesToSummarize: [{ role: "user", content: "old request", timestamp: 1 }],
+			messagesToSummarize: [{ role: "user", content: "compact-conversation-marker", timestamp: 1 }],
 			turnPrefixMessages: [],
+			previousSummary: "compact-previous-summary-marker",
 			tokensBefore: 20,
 		},
 		branchEntries: [],
 		reason: "manual",
 		willRetry: false,
 		signal: new AbortController().signal,
+		customInstructions: "compact-custom-instructions-marker",
 	} as unknown as SessionBeforeCompactEvent;
 }
 
@@ -177,6 +184,24 @@ describe("Luna/max compaction hook", () => {
 			purpose: "compact",
 		});
 		expect(fixture.releases).toBe(0);
+		const request = vi.mocked(completeHarnessTask).mock.calls[0]?.[0];
+		expect(request?.selection).toEqual(LUNA_MAX);
+		expect(request?.context.systemPrompt).toContain("structured checkpoint");
+		expect(request?.context.systemPrompt).not.toContain("compact-conversation-marker");
+		expect(request?.context.systemPrompt).not.toContain("compact-previous-summary-marker");
+		expect(request?.context.systemPrompt).not.toContain("compact-custom-instructions-marker");
+		const userMessage = request?.context.messages[0];
+		if (!userMessage || userMessage.role !== "user" || typeof userMessage.content !== "string") {
+			throw new Error("Compaction model input was not a single user data message");
+		}
+		const userData = JSON.parse(userMessage.content) as {
+			conversation: string;
+			previousSummary: string;
+			customInstructions: string;
+		};
+		expect(userData.previousSummary).toBe("compact-previous-summary-marker");
+		expect(userData.customInstructions).toBe("compact-custom-instructions-marker");
+		expect(userData.conversation).toContain("compact-conversation-marker");
 		const success = fixture.handlers.get("session_compact")?.[0] as unknown as TerminalHandler;
 		success({ type: "session_compact" } as unknown as SessionCompactEvent, fixture.context);
 		expect(fixture.releases).toBe(1);
@@ -195,5 +220,19 @@ describe("Luna/max compaction hook", () => {
 		);
 		expect(fixture.releases).toBe(1);
 		expect(fixture.notify).toHaveBeenCalledTimes(1);
+	});
+});
+it("uses an explicit compact-purpose model selection", async () => {
+	vi.mocked(completeHarnessTask).mockResolvedValueOnce(response);
+	vi.mocked(harnessResponseText).mockReturnValue("checkpoint");
+	const compactModel = { provider: "openai-codex", model: "gpt-6-sol", thinking: "low" } as const;
+	const fixture = setup(compactModel);
+	const handleBeforeCompact = fixture.handlers.get("session_before_compact")?.[0] as unknown as CompactionHandler;
+
+	await handleBeforeCompact(event(), fixture.context);
+
+	expect(vi.mocked(completeHarnessTask).mock.calls[0]?.[0]).toMatchObject({
+		selection: compactModel,
+		purpose: "compact",
 	});
 });

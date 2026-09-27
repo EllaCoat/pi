@@ -2,7 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fauxAssistantMessage, type UserMessage } from "@earendil-works/pi-ai";
 import { describe, expect, test } from "vitest";
+import type { SessionEntry } from "../../src/core/session-manager.ts";
 import {
 	type CuratedMemory,
 	type MemoryExcerpt,
@@ -11,6 +13,7 @@ import {
 	PersonalMemoryStore,
 } from "../../src/personal-harness/memory/index.ts";
 import { redactSensitiveText } from "../../src/personal-harness/memory/store.ts";
+import { memoryRecordsFromBranch } from "../../src/personal-harness/session-data.ts";
 
 function makeRecord(overrides: Partial<MemorySourceRecord> = {}): MemorySourceRecord {
 	return {
@@ -57,6 +60,46 @@ function citationOf(record: MemoryExcerpt): CuratedMemory["citations"][number] {
 }
 
 describe("personal harness memory", () => {
+	test("indexes ordinary AgentSession messages extracted from a branch", async () => {
+		await withDatabase(async (databasePath) => {
+			const sessionId = "session-agent-fixture";
+			const userMessage = {
+				role: "user",
+				content: [{ type: "text", text: "The cobalt fixture is filed under archive." }],
+				timestamp: Date.now(),
+			} satisfies UserMessage;
+			const entries: SessionEntry[] = [
+				{
+					type: "message",
+					id: "user-agent-fixture",
+					parentId: null,
+					timestamp: "2026-09-27T20:00:00.000Z",
+					message: userMessage,
+				},
+				{
+					type: "message",
+					id: "assistant-agent-fixture",
+					parentId: "user-agent-fixture",
+					timestamp: "2026-09-27T20:00:01.000Z",
+					message: fauxAssistantMessage("The cobalt fixture is filed under archive."),
+				},
+			];
+			const records = memoryRecordsFromBranch(entries, sessionId, "branch-agent-fixture");
+			expect(records.map((record) => record.entryId)).toEqual(["user-agent-fixture", "assistant-agent-fixture"]);
+
+			const memory = new PersonalMemoryStore({ databasePath });
+			try {
+				expect(memory.index(records)).toMatchObject({ inserted: 2, skipped: 0 });
+				expect(memory.search("cobalt fixture", { sessionId }).candidates.map((record) => record.entryId)).toEqual([
+					"assistant-agent-fixture",
+					"user-agent-fixture",
+				]);
+			} finally {
+				memory.close();
+			}
+		});
+	});
+
 	test("searches Japanese and code text, skips derived recalls, and masks known credential shapes", async () => {
 		await withDatabase(async (databasePath) => {
 			const memory = new PersonalMemoryStore({ databasePath });
@@ -156,6 +199,8 @@ describe("personal harness memory", () => {
 				const result = await memory.recall("cacheMode stable");
 				expect(result.status).toBe("curated");
 				expect(result.citations).toHaveLength(1);
+				expect(result.records).toEqual([]);
+
 				expect(result.citations[0]?.entryId).toBe(source.entryId);
 				const noMatch = await memory.recall("query absent from all indexed records");
 				expect(noMatch.status).toBe("empty");
@@ -178,6 +223,67 @@ describe("personal harness memory", () => {
 				expect(result.citations[0]?.entryId).toBe(source.entryId);
 			} finally {
 				fallback.close();
+			}
+		});
+	});
+	test("uses host-owned excerpt ranges instead of model-invented pinpoint citations", async () => {
+		await withDatabase(async (databasePath) => {
+			const source = makeRecord({
+				content: "The reference ID is ATTACH-85. The tail marker is uv-postfix-6c2f and its line is 418.",
+			});
+			const memory = new PersonalMemoryStore({
+				databasePath,
+				curate: async (_query, records) => ({
+					text: "ATTACH-85 / uv-postfix-6c2f / 418",
+					citations: [
+						{ ...citationOf(records[0]), range: { start: records[0].range.end - 4, end: records[0].range.end } },
+					],
+				}),
+			});
+			try {
+				memory.index([source]);
+				const result = await memory.recall("ATTACH-85 marker");
+				expect(result.status).toBe("curated");
+				expect(result.citations[0].range).toEqual({ start: 0, end: source.content.length });
+				const read = memory.readSource(result.citations[0], result.citations[0].range);
+				expect(read.content).toContain("ATTACH-85");
+				expect(read.content).toContain("uv-postfix-6c2f");
+				expect(result.records).toEqual([]);
+			} finally {
+				memory.close();
+			}
+		});
+	});
+	test("accepts curated text through 5,000 characters without repeating candidates and falls back above it", async () => {
+		await withDatabase(async (databasePath) => {
+			const source = makeRecord({
+				entryId: "output-limit-source",
+				content: `outputLimitNeedle ${"supporting context ".repeat(300)}`,
+			});
+			let curatedText = "c".repeat(5_000);
+			const memory = new PersonalMemoryStore({
+				databasePath,
+				curate: async (_query, records) => ({
+					text: curatedText,
+					citations: [citationOf(records[0])],
+				}),
+			});
+			try {
+				memory.index([source]);
+				const result = await memory.recall("outputLimitNeedle");
+				expect(result.status).toBe("curated");
+				expect(result.content).toHaveLength(5_000);
+				expect(result.records).toEqual([]);
+				expect(result.citations).toHaveLength(1);
+
+				curatedText = "c".repeat(5_001);
+				const oversized = await memory.recall("outputLimitNeedle");
+				expect(oversized.status).toBe("excerpt");
+				expect(oversized.reason).toBe("output-too-large");
+				expect(oversized.records).toHaveLength(1);
+				expect(oversized.content).toContain("outputLimitNeedle");
+			} finally {
+				memory.close();
 			}
 		});
 	});

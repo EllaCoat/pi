@@ -300,7 +300,7 @@ describe("personal harness extension in an AgentSession", () => {
 			const first = await create(dataDir);
 			first.setResponses([fauxAssistantMessage("The cobalt fixture is stored in the archive.")]);
 			await first.session.prompt("Remember where the cobalt fixture is stored.");
-			vi.spyOn(modelCalls, "completeHarnessTask").mockImplementation(async (options) => {
+			const memoryCalls = vi.spyOn(modelCalls, "completeHarnessTask").mockImplementation(async (options) => {
 				const content = options.context.messages[0].content;
 				if (typeof content !== "string") throw new Error("Expected structured curator input");
 				const input = JSON.parse(content) as { records: MemoryExcerpt[] };
@@ -325,7 +325,11 @@ describe("personal harness extension in an AgentSession", () => {
 					{ stopReason: "toolUse" },
 				);
 			});
-			const second = await create(dataDir);
+			const second = await create(
+				dataDir,
+				{ allowedToolNames: ["eval", "memory", "recall", "notes"] },
+				{ backgroundTodoModel: { provider: "fixture", model: "todo-only", thinking: "off" } },
+			);
 			second.setResponses([
 				fauxAssistantMessage(
 					[
@@ -349,6 +353,54 @@ describe("personal harness extension in an AgentSession", () => {
 				fauxAssistantMessage("Looked up the prior record."),
 			]);
 			await second.session.prompt("Consult previous work.");
+			const responseEntries = second.sessionManager.getBranch();
+			if (mode === "direct") {
+				const recallEntry = responseEntries.findLast(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "toolResult" &&
+						entry.message.toolName === "recall",
+				);
+				expect(
+					recallEntry?.type === "message" && recallEntry.message.role === "toolResult"
+						? recallEntry.message.isError
+						: undefined,
+				).not.toBe(true);
+				expect(resultText(second, "recall")[0]).toContain("DERIVED_ONLY_SENTINEL");
+			} else {
+				const evalEntry = responseEntries.find(
+					(entry) =>
+						entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "eval",
+				);
+				const evalMessage =
+					evalEntry?.type === "message" && evalEntry.message.role === "toolResult" ? evalEntry.message : undefined;
+				const toolExecutions = (
+					evalMessage?.details as
+						| { toolExecutions?: { name: string; status: string; harnessDerivedRecall?: boolean }[] }
+						| undefined
+				)?.toolExecutions;
+				expect(resultText(second, "eval")[0]).toContain("DERIVED_ONLY_SENTINEL");
+				expect(toolExecutions).toMatchObject([{ name: "recall", status: "success", harnessDerivedRecall: true }]);
+			}
+			const memoryRequest = memoryCalls.mock.calls
+				.map(([request]) => request)
+				.find((request) => request.purpose === "memory");
+			expect(memoryRequest).toMatchObject({
+				selection: { provider: "openai-codex", model: "gpt-6-luna", thinking: "high", fast: true },
+				purpose: "memory",
+				maxTokens: 16_384,
+			});
+			expect(memoryRequest?.context.systemPrompt).toContain("return_memory_curate");
+			expect(memoryRequest?.context.systemPrompt).toContain("Preserve ordinary project identifiers");
+			expect(memoryRequest?.context.systemPrompt).toContain("failed or unverified outcomes");
+			expect(memoryRequest?.context.systemPrompt).toContain("Do not repeat actual credential or secret values");
+			expect(memoryRequest?.context.systemPrompt).not.toContain("Personal OMP profile tool mapping");
+			expect(memoryRequest?.context.tools?.map((tool) => tool.name)).toEqual(["return_memory_curate"]);
+			const curatorMessage = memoryRequest?.context.messages[0];
+			if (!curatorMessage || curatorMessage.role !== "user" || typeof curatorMessage.content !== "string") {
+				throw new Error("Memory curator input was not confined to one user data message");
+			}
+			expect(JSON.parse(curatorMessage.content)).toMatchObject({ query: "cobalt fixture" });
 			expect(resultText(second, mode === "direct" ? "recall" : "eval")[0]).toContain("DERIVED_ONLY_SENTINEL");
 			if (mode === "eval") {
 				expect(resultText(second, "eval")[1]).toContain("DERIVED_ONLY_SENTINEL");

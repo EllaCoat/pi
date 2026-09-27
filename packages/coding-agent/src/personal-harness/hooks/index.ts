@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { HarnessModelSelection } from "../model-call.ts";
 import type { HarnessUsageLedger } from "../usage.ts";
 import { installModelCompactionHook } from "./compaction.ts";
 import {
@@ -49,6 +50,7 @@ export interface HarnessHookOptions {
 	timeZone?: string;
 	makeGoalSkillPath?: string;
 	additionalReadRoots?: readonly string[];
+	compactModel?: HarnessModelSelection;
 }
 
 interface PendingInput {
@@ -549,5 +551,9 @@ export function installHooks(pi: ExtensionAPI, options: HarnessHookOptions): voi
 	installInputAdvice(pi, options);
 	installReread(pi, options);
 	installLightCompact(pi, options);
-	installModelCompactionHook(pi, { hold: options.hold, ledger: options.ledger });
+	installModelCompactionHook(pi, {
+		hold: options.hold,
+		ledger: options.ledger,
+		compactModel: options.compactModel,
+	});
 }
