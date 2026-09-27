@@ -140,7 +140,9 @@ const TodoParameters = Type.Object({
 	]),
 	title: Type.Optional(Type.String()),
 	id: Type.Optional(Type.String()),
-	status: Type.Optional(Type.Union([Type.Literal("pending"), Type.Literal("in_progress"), Type.Literal("blocked")])),
+	status: Type.Optional(
+		Type.Union([Type.Literal("pending"), Type.Literal("in_progress"), Type.Literal("blocked"), Type.Literal("done")]),
+	),
 });
 const GoalParameters = Type.Object({
 	op: Type.Union([
@@ -1228,7 +1230,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		pi.registerTool({
 			name: "todo",
 			label: "personal todo",
-			description: "List or manually edit the session TODO list; completion needs observed successful evidence.",
+			description: "Read or overwrite the session TODO status, including manual completion.",
 			promptSnippet: "View or edit the lightweight session TODO list.",
 			parameters: TodoParameters,
 			constrainedSampling: { type: "json_schema", strict: "prefer" },

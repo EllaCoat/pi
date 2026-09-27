@@ -543,6 +543,29 @@ describe("personal harness extension in an AgentSession", () => {
 		}
 	});
 
+	it("lets the Main TODO tool overwrite status to done and read it back", async () => {
+		const harness = await create(dataDirectory());
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("todo", { action: "add", title: "Manual progress fixture" })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("added"),
+		]);
+		await harness.session.prompt("Add a TODO");
+		const added = JSON.parse(resultText(harness, "todo").at(-1)!) as { items: { id: string }[] };
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("todo", { action: "status", id: added.items[0].id, status: "done" })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage([fauxToolCall("todo", { action: "list" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("updated"),
+		]);
+		await harness.session.prompt("Mark the task complete and read its status");
+		expect(JSON.parse(resultText(harness, "todo").at(-1)!)).toMatchObject({
+			items: [{ title: "Manual progress fixture", status: "done", completion: { kind: "manual" } }],
+		});
+	});
+
 	it("normalizes strict-model null optionals before applying background TODO updates", async () => {
 		vi.spyOn(modelCalls, "completeHarnessTask").mockImplementation(async (options) => {
 			const input = JSON.parse(String(options.context.messages[0].content)) as {
