@@ -1,9 +1,6 @@
 import type {
 	TodoCapture,
-	TodoEvidenceInput,
-	TodoItem,
 	TodoManualChange,
-	TodoModelEvidence,
 	TodoModelPreview,
 	TodoScope,
 	TodoSnapshot,
@@ -11,8 +8,11 @@ import type {
 	TodoStatus,
 } from "./state.ts";
 
+export const TODO_CHANGE_CHECK_INTERVAL_MS = 60_000;
+export const TODO_MODEL_UPDATE_INTERVAL_MS = 300_000;
+
 export type TodoChangeKind = "request" | "tool" | "verification" | "child" | "todo" | "memory";
-export type TodoPersistenceReason = "manual" | "evidence" | "model" | "retry" | "shutdown";
+export type TodoPersistenceReason = "manual" | "model" | "retry" | "shutdown";
 
 export interface TodoChangeDelta {
 	scope: TodoScope;
@@ -20,6 +20,7 @@ export interface TodoChangeDelta {
 	kind: TodoChangeKind;
 	summary: string;
 }
+
 export interface TodoModelChange {
 	entryId: string;
 	kind: TodoChangeKind;
@@ -30,13 +31,11 @@ export interface TodoModelItem {
 	id: string;
 	title: string;
 	status: TodoStatus;
-	evidenceEntryIds: string[];
 }
 
 export interface TodoModelRequest {
 	changes: TodoModelChange[];
 	currentTodo: TodoModelItem[];
-	observedEvidence: TodoModelEvidence[];
 }
 
 export type TodoModelUpdater = (request: TodoModelRequest, signal: AbortSignal) => Promise<unknown>;
@@ -50,13 +49,8 @@ export interface TodoUpdateSchedulerOptions {
 	updateModel: TodoModelUpdater;
 	appendSessionEntry: TodoSessionEntryAppender;
 	notifyUi: TodoUiNotifier;
-	debounceMs?: number;
-}
-
-interface HeldModelResult {
-	capture: TodoCapture;
-	changes: TodoChangeDelta[];
-	response: unknown;
+	checkIntervalMs?: number;
+	modelIntervalMs?: number;
 }
 
 export class TodoUpdateScheduler {
@@ -64,38 +58,44 @@ export class TodoUpdateScheduler {
 	#updateModel: TodoModelUpdater;
 	#appendSessionEntry: TodoSessionEntryAppender;
 	#notifyUi: TodoUiNotifier;
-	#debounceMs: number;
+	#bufferedDeltas = new Map<string, TodoChangeDelta>();
 	#pendingDeltas = new Map<string, TodoChangeDelta>();
 	#inFlightChanges: TodoChangeDelta[] = [];
 	#ownEntryIds = new Set<string>();
-	#timer: NodeJS.Timeout | undefined;
+	#checkTimer: NodeJS.Timeout;
+	#modelTimer: NodeJS.Timeout;
 	#activeController: AbortController | undefined;
-	#heldResult: HeldModelResult | undefined;
+	#dispatchPromise: Promise<void> | undefined;
+	#shutdownPromise: Promise<void> | undefined;
 	#running = false;
-	#paused = false;
 	#closed = false;
-	#compressionHolds = 0;
 	#persistingDepth = 0;
 	#awaitingRequestDeltas = 0;
 	#persistenceDirty = false;
 
 	constructor(options: TodoUpdateSchedulerOptions) {
-		if (!Number.isFinite(options.debounceMs ?? 250) || (options.debounceMs ?? 250) < 0) {
-			throw new Error("TODO debounceMs must be a non-negative number");
-		}
+		const checkIntervalMs = options.checkIntervalMs ?? TODO_CHANGE_CHECK_INTERVAL_MS;
+		const modelIntervalMs = options.modelIntervalMs ?? TODO_MODEL_UPDATE_INTERVAL_MS;
+		if (!Number.isFinite(checkIntervalMs) || checkIntervalMs <= 0)
+			throw new Error("TODO checkIntervalMs must be a positive number");
+		if (!Number.isFinite(modelIntervalMs) || modelIntervalMs <= 0)
+			throw new Error("TODO modelIntervalMs must be a positive number");
 		this.state = options.state;
 		this.#updateModel = options.updateModel;
 		this.#appendSessionEntry = options.appendSessionEntry;
 		this.#notifyUi = options.notifyUi;
-		this.#debounceMs = options.debounceMs ?? 250;
+		this.#checkTimer = setInterval(() => this.#collectDeltas(), checkIntervalMs);
+		this.#modelTimer = setInterval(() => this.#runModelWindow(), modelIntervalMs);
+		this.#checkTimer.unref();
+		this.#modelTimer.unref();
 	}
 
 	get pendingEntryIds(): readonly string[] {
 		return [
 			...new Set([
+				...this.#bufferedDeltas.keys(),
 				...this.#pendingDeltas.keys(),
 				...this.#inFlightChanges.map((change) => change.entryId),
-				...(this.#heldResult?.changes.map((change) => change.entryId) ?? []),
 			]),
 		];
 	}
@@ -114,27 +114,22 @@ export class TodoUpdateScheduler {
 		) {
 			return false;
 		}
-		if (change.kind === "request" && this.#awaitingRequestDeltas === 0) this.invalidateForNewRequest();
+		if (change.kind === "request" && this.#awaitingRequestDeltas === 0) this.beginRequest();
 		const delta = { ...change, scope: { ...change.scope } };
-		this.#pendingDeltas.delete(delta.entryId);
-		this.#pendingDeltas.set(delta.entryId, delta);
+		this.#bufferedDeltas.delete(delta.entryId);
+		this.#bufferedDeltas.set(delta.entryId, delta);
 		if (change.kind === "request") this.#awaitingRequestDeltas -= 1;
-		this.#paused = this.#awaitingRequestDeltas > 0;
-		this.#schedule();
 		return true;
 	}
-	invalidateForNewRequest(): void {
+
+	beginRequest(): void {
 		if (this.#closed) return;
-		this.#clearTimer();
-		this.state.noteUpdateRequest();
 		this.#awaitingRequestDeltas += 1;
-		this.#paused = true;
-		if (this.#heldResult) {
-			const held = this.#heldResult;
-			this.#heldResult = undefined;
-			this.#requeue(held.changes);
-		}
-		this.#activeController?.abort();
+	}
+
+	completeRequestWithoutDelta(): void {
+		if (this.#closed || this.#awaitingRequestDeltas === 0) return;
+		this.#awaitingRequestDeltas -= 1;
 	}
 
 	applyManualChange(change: TodoManualChange): boolean {
@@ -162,30 +157,6 @@ export class TodoUpdateScheduler {
 		return this.applyManualChange({ type: "remove", id });
 	}
 
-	recordEvidence(input: TodoEvidenceInput): boolean {
-		if (this.#closed) return false;
-		const candidate = this.state.prepareEvidence(input);
-		if (!candidate || !this.state.commit(candidate)) return false;
-		this.#notifyUpdated();
-		this.#persistCommitted(candidate.snapshot, candidate.reason);
-		return true;
-	}
-
-	flush(): void {
-		this.#clearTimer();
-		void this.#dispatch();
-	}
-
-	retryPending(): void {
-		if (this.#closed) return;
-		this.#paused = this.#awaitingRequestDeltas > 0;
-		if (this.#persistenceDirty && !this.#persistCurrent("retry")) {
-			this.#paused = true;
-			return;
-		}
-		this.#schedule();
-	}
-
 	retryPersistence(): boolean {
 		if (this.#closed) return false;
 		if (!this.#persistenceDirty) return true;
@@ -193,34 +164,7 @@ export class TodoUpdateScheduler {
 	}
 
 	abortCurrentUpdate(): void {
-		if (this.#heldResult) {
-			const held = this.#heldResult;
-			this.#heldResult = undefined;
-			this.#requeue(held.changes);
-			this.#paused = true;
-		}
 		this.#activeController?.abort();
-	}
-
-	acquireCompressionHold(): () => void {
-		if (this.#closed) throw new Error("TODO update scheduler is shut down");
-		this.#compressionHolds += 1;
-		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			this.#compressionHolds -= 1;
-			if (this.#compressionHolds === 0) this.#releaseAfterCompression();
-		};
-	}
-
-	async withCompressionHold<T>(operation: () => T | Promise<T>): Promise<T> {
-		const release = this.acquireCompressionHold();
-		try {
-			return await operation();
-		} finally {
-			release();
-		}
 	}
 
 	restore(snapshot: unknown): boolean {
@@ -234,109 +178,95 @@ export class TodoUpdateScheduler {
 		this.#invalidateForScopeChange();
 	}
 
-	shutdown(): void {
-		if (this.#closed) return;
+	/**
+	 * Abort active work and wait for its update callback to settle so final usage can be recorded.
+	 * If the updater ignores abort and never settles, shutdown remains pending.
+	 */
+	shutdown(): Promise<void> {
+		if (this.#shutdownPromise) return this.#shutdownPromise;
 		this.#closed = true;
-		this.#clearTimer();
+		this.#clearTimers();
 		this.#activeController?.abort();
+		if (this.#persistenceDirty) this.#persistCurrent("shutdown");
+		this.#bufferedDeltas.clear();
 		this.#pendingDeltas.clear();
-		this.#heldResult = undefined;
-		if (this.#persistenceDirty && this.#compressionHolds === 0) this.#persistCurrent("shutdown");
+		this.#shutdownPromise = this.#dispatchPromise ?? Promise.resolve();
+		return this.#shutdownPromise;
 	}
 
-	async #dispatch(): Promise<void> {
-		if (
-			this.#closed ||
-			this.#paused ||
-			this.#awaitingRequestDeltas > 0 ||
-			this.#running ||
-			this.#heldResult ||
-			this.#pendingDeltas.size === 0
-		) {
-			return;
+	#collectDeltas(): void {
+		if (this.#closed || this.#bufferedDeltas.size === 0) return;
+		for (const delta of this.#bufferedDeltas.values()) {
+			if (!this.state.matchesScope(delta.scope) || this.#ownEntryIds.has(delta.entryId)) continue;
+			this.#pendingDeltas.delete(delta.entryId);
+			this.#pendingDeltas.set(delta.entryId, delta);
 		}
-		if (this.#persistenceDirty && !this.#persistCurrent("retry")) {
-			this.#paused = true;
-			return;
-		}
+		this.#bufferedDeltas.clear();
+	}
+
+	#runModelWindow(): void {
+		if (this.#closed) return;
+		this.#collectDeltas();
+		if (this.#running || this.#awaitingRequestDeltas > 0 || this.#pendingDeltas.size === 0) return;
+		if (this.#persistenceDirty && !this.#persistCurrent("retry")) return;
 
 		const changes = [...this.#pendingDeltas.values()];
-		this.#inFlightChanges = changes;
 		this.#pendingDeltas.clear();
+		this.#inFlightChanges = changes;
 		const snapshot = this.state.snapshot;
 		const capture = this.state.capture();
-		const currentTodo = snapshot.items.map((item) => this.#toModelItem(item));
-		const relevantEvidenceIds = new Set(changes.map((change) => change.entryId));
-		for (const item of currentTodo) {
-			for (const entryId of item.evidenceEntryIds) relevantEvidenceIds.add(entryId);
-		}
-		const observedEvidence: TodoModelEvidence[] = [];
-		for (const evidence of snapshot.evidence) {
-			if (evidence.source === "child_report" || !relevantEvidenceIds.has(evidence.entryId)) continue;
-			observedEvidence.push({
-				entryId: evidence.entryId,
-				source: evidence.source,
-				outcome: evidence.outcome,
-				generation: evidence.generation,
-			});
-		}
+		const request: TodoModelRequest = {
+			changes: changes.map(({ entryId, kind, summary }) => ({ entryId, kind, summary })),
+			currentTodo: snapshot.items.map(({ id, title, status }) => ({ id, title, status })),
+		};
 		const controller = new AbortController();
 		this.#activeController = controller;
 		this.#running = true;
+		const dispatch = this.#dispatch(request, capture, changes, controller);
+		let tracked: Promise<void>;
+		tracked = dispatch.finally(() => {
+			if (this.#dispatchPromise === tracked) this.#dispatchPromise = undefined;
+		});
+		this.#dispatchPromise = tracked;
+	}
+
+	async #dispatch(
+		request: TodoModelRequest,
+		capture: TodoCapture,
+		changes: TodoChangeDelta[],
+		controller: AbortController,
+	): Promise<void> {
 		try {
-			const response = await this.#updateModel(
-				{
-					changes: changes.map(({ entryId, kind, summary }) => ({ entryId, kind, summary })),
-					currentTodo,
-					observedEvidence,
-				},
-				controller.signal,
-			);
+			const response = await this.#updateModel(request, controller.signal);
 			if (this.#closed || !this.state.matchesScope(capture)) return;
 			if (controller.signal.aborted) {
 				this.#requeue(changes);
-				this.#paused =
-					this.#awaitingRequestDeltas > 0 || this.state.capture().requestGeneration === capture.requestGeneration;
 				return;
 			}
 			this.#inFlightChanges = [];
-			const result: HeldModelResult = { capture, changes, response };
-			if (this.#compressionHolds > 0) {
-				this.#heldResult = result;
-				return;
-			}
-			this.#applyModelResult(result);
+			this.#applyModelResult({ capture, changes, response });
 		} catch {
 			if (this.#closed || !this.state.matchesScope(capture)) return;
 			this.#requeue(changes);
-			this.#paused =
-				this.#awaitingRequestDeltas > 0 || this.state.capture().requestGeneration === capture.requestGeneration;
 			if (!controller.signal.aborted)
-				this.#notifyError("Background TODO update failed; changes remain queued for retry.");
+				this.#notifyError("Background TODO update failed; changes remain queued for the next update window.");
 		} finally {
 			this.#inFlightChanges = [];
 			this.#running = false;
 			this.#activeController = undefined;
-			if (
-				!this.#closed &&
-				!this.#paused &&
-				this.#awaitingRequestDeltas === 0 &&
-				!this.#heldResult &&
-				this.#pendingDeltas.size > 0
-			)
-				this.#schedule();
 		}
 	}
 
-	#applyModelResult(result: HeldModelResult): void {
+	#applyModelResult(result: { capture: TodoCapture; changes: TodoChangeDelta[]; response: unknown }): void {
 		if (this.#closed || !this.state.matchesScope(result.capture)) return;
 		let preview: TodoModelPreview;
 		try {
 			preview = this.state.previewModelUpdate(result.capture, result.response);
 		} catch {
 			this.#requeue(result.changes);
-			this.#paused = true;
-			this.#notifyError("Background TODO update could not be prepared; changes remain queued for retry.");
+			this.#notifyError(
+				"Background TODO update could not be prepared; changes remain queued for the next update window.",
+			);
 			return;
 		}
 		if (preview.kind === "stale") {
@@ -345,14 +275,14 @@ export class TodoUpdateScheduler {
 		}
 		if (preview.kind === "invalid") {
 			this.#requeue(result.changes);
-			this.#paused = true;
-			this.#notifyError("Background TODO update returned invalid data; changes remain queued for retry.");
+			this.#notifyError(
+				"Background TODO update returned invalid data; changes remain queued for the next update window.",
+			);
 			return;
 		}
 		if (preview.kind === "unchanged") return;
 		if (!this.#appendSnapshot(preview.candidate.snapshot, "model")) {
 			this.#requeue(result.changes);
-			this.#paused = true;
 			return;
 		}
 		if (!this.state.commit(preview.candidate)) {
@@ -363,20 +293,7 @@ export class TodoUpdateScheduler {
 		this.#notifyUpdated();
 	}
 
-	#releaseAfterCompression(): void {
-		if (this.#closed) return;
-		const held = this.#heldResult;
-		this.#heldResult = undefined;
-		if (held) this.#applyModelResult(held);
-		if (this.#persistenceDirty && !this.#heldResult) this.#persistCurrent("retry");
-		if (!this.#paused && this.#pendingDeltas.size > 0) this.#schedule();
-	}
-
 	#persistCommitted(snapshot: TodoSnapshot, reason: TodoPersistenceReason): void {
-		if (this.#compressionHolds > 0) {
-			this.#persistenceDirty = true;
-			return;
-		}
 		this.#appendSnapshot(snapshot, reason);
 	}
 
@@ -385,13 +302,9 @@ export class TodoUpdateScheduler {
 	}
 
 	#appendSnapshot(snapshot: TodoSnapshot, reason: TodoPersistenceReason): boolean {
-		if (this.#compressionHolds > 0) {
-			this.#persistenceDirty = true;
-			return false;
-		}
 		this.#persistingDepth += 1;
 		try {
-			const entryId = this.#appendSessionEntry(cloneSnapshot(snapshot), reason);
+			const entryId = this.#appendSessionEntry(structuredClone(snapshot), reason);
 			if (entryId) this.#ownEntryIds.add(entryId);
 			this.#persistenceDirty = false;
 			return true;
@@ -421,66 +334,24 @@ export class TodoUpdateScheduler {
 	}
 
 	#requeue(changes: TodoChangeDelta[]): void {
-		const merged = new Map<string, TodoChangeDelta>();
-		for (const delta of [...changes, ...this.#pendingDeltas.values()]) {
+		for (const delta of changes) {
 			if (!this.state.matchesScope(delta.scope) || this.#ownEntryIds.has(delta.entryId)) continue;
-			merged.delete(delta.entryId);
-			merged.set(delta.entryId, delta);
+			this.#pendingDeltas.delete(delta.entryId);
+			this.#pendingDeltas.set(delta.entryId, delta);
 		}
-		this.#pendingDeltas = merged;
-	}
-
-	#schedule(): void {
-		if (
-			this.#closed ||
-			this.#paused ||
-			this.#awaitingRequestDeltas > 0 ||
-			this.#pendingDeltas.size === 0 ||
-			this.#heldResult
-		) {
-			return;
-		}
-		this.#clearTimer();
-		this.#timer = setTimeout(() => {
-			this.#timer = undefined;
-			this.flush();
-		}, this.#debounceMs);
-	}
-
-	#clearTimer(): void {
-		if (this.#timer !== undefined) clearTimeout(this.#timer);
-		this.#timer = undefined;
 	}
 
 	#invalidateForScopeChange(): void {
-		this.#clearTimer();
 		this.#activeController?.abort();
+		this.#bufferedDeltas.clear();
 		this.#pendingDeltas.clear();
-		this.#heldResult = undefined;
 		this.#ownEntryIds.clear();
 		this.#persistenceDirty = false;
 		this.#awaitingRequestDeltas = 0;
-		this.#paused = false;
 	}
 
-	#toModelItem(item: TodoItem): TodoModelItem {
-		return {
-			id: item.id,
-			title: item.title,
-			status: item.status,
-			evidenceEntryIds: [...item.evidenceEntryIds],
-		};
+	#clearTimers(): void {
+		clearInterval(this.#checkTimer);
+		clearInterval(this.#modelTimer);
 	}
-}
-
-function cloneSnapshot(snapshot: TodoSnapshot): TodoSnapshot {
-	return {
-		...snapshot,
-		items: snapshot.items.map((item) => ({
-			...item,
-			evidenceEntryIds: [...item.evidenceEntryIds],
-			...(item.completion ? { completion: { ...item.completion } } : {}),
-		})),
-		evidence: snapshot.evidence.map((entry) => ({ ...entry })),
-	};
 }

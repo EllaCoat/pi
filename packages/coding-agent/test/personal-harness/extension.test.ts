@@ -8,6 +8,7 @@ import {
 	fauxToolCall,
 	getCurrentTools,
 	type TranscriptContext,
+	type Usage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -19,10 +20,12 @@ import {
 } from "../../src/personal-harness/extension.ts";
 import { INPUT_SOURCE_ENTRY } from "../../src/personal-harness/hooks/input-advice.ts";
 import type { JevEvaluationInput, JevEvaluationResponse } from "../../src/personal-harness/hooks/jev-types.ts";
+import { isRecord } from "../../src/personal-harness/hooks/jev-types.ts";
 import type { HarnessMcpClient } from "../../src/personal-harness/mcp/index.ts";
 import { type MemoryExcerpt, PersonalMemoryStore } from "../../src/personal-harness/memory/index.ts";
 import * as modelCalls from "../../src/personal-harness/model-call.ts";
 import { TODO_SESSION_ENTRY_TYPE } from "../../src/personal-harness/todo/index.ts";
+import type { HarnessUsageLedger } from "../../src/personal-harness/usage.ts";
 import { createHarness, getMessageText, type Harness } from "../suite/harness.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
 
@@ -62,7 +65,7 @@ describe("personal harness extension in an AgentSession", () => {
 			tools: extra.tools ?? [echo],
 			settings: { cacheWarming: "off", ...extra.settings },
 			extensionFactories: [
-				createPersonalHarnessExtension({ dataDir, todoDebounceMs: 60_000, ...options }),
+				createPersonalHarnessExtension({ dataDir, ...options }),
 				...(extra.extensionFactories ?? []),
 			],
 		});
@@ -404,22 +407,6 @@ describe("personal harness extension in an AgentSession", () => {
 			expect(resultText(second, mode === "direct" ? "recall" : "eval")[0]).toContain("DERIVED_ONLY_SENTINEL");
 			if (mode === "eval") {
 				expect(resultText(second, "eval")[1]).toContain("DERIVED_ONLY_SENTINEL");
-				const branch = second.sessionManager.getBranch();
-				const evalIds = new Set(
-					branch
-						.filter(
-							(entry) =>
-								entry.type === "message" &&
-								entry.message.role === "toolResult" &&
-								entry.message.toolName === "eval",
-						)
-						.map((entry) => entry.id),
-				);
-				for (const entry of branch) {
-					if (entry.type !== "custom" || entry.customType !== TODO_SESSION_ENTRY_TYPE) continue;
-					const snapshot = entry.data as { evidence: { entryId: string }[] };
-					expect(snapshot.evidence.some((evidence) => evalIds.has(evidence.entryId))).toBe(false);
-				}
 			}
 			const reader = new PersonalMemoryStore({ databasePath: join(dataDir, "memory.sqlite") });
 			try {
@@ -503,7 +490,7 @@ describe("personal harness extension in an AgentSession", () => {
 		}
 	});
 
-	it("does not turn a failed nested operation into successful TODO evidence", async () => {
+	it("keeps failed operation details without a TODO evidence ledger", async () => {
 		const fail: AgentTool = {
 			...echo,
 			name: "fail",
@@ -530,12 +517,21 @@ describe("personal harness extension in an AgentSession", () => {
 			isError: false,
 			details: { toolExecutions: [{ name: "fail", status: "failure" }] },
 		});
+
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("todo", { action: "add", title: "Review the failed operation" })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("Added a progress item."),
+		]);
+		await harness.session.prompt("Keep a lightweight progress item");
 		const saved = harness.sessionManager
 			.getBranch()
-			.findLast((entry) => entry.type === "custom" && entry.customType === TODO_SESSION_ENTRY_TYPE);
+			.findLast((candidate) => candidate.type === "custom" && candidate.customType === TODO_SESSION_ENTRY_TYPE);
 		expect(saved?.type === "custom" ? saved.data : undefined).toMatchObject({
-			evidence: expect.arrayContaining([expect.objectContaining({ entryId: entry?.id, outcome: "failure" })]),
+			items: [{ title: "Review the failed operation", status: "pending" }],
 		});
+		expect(saved?.type === "custom" ? saved.data : undefined).not.toHaveProperty("evidence");
 	});
 
 	it("discovers a tools-only MCP server and preserves structured-only results through eval", async () => {
@@ -633,7 +629,8 @@ describe("personal harness extension in an AgentSession", () => {
 			dataDirectory(),
 			{},
 			{
-				todoDebounceMs: 1,
+				todoCheckIntervalMs: 1,
+				todoModelUpdateIntervalMs: 10,
 				createSubagentSession: async () => ({
 					prompt: async () => childGate.promise,
 					abort: async () => childGate.resolve(),
@@ -685,19 +682,6 @@ describe("personal harness extension in an AgentSession", () => {
 			fauxAssistantMessage("child report read"),
 		]);
 		await harness.session.prompt("Read the child report without treating it as verification");
-		const branch = harness.sessionManager.getBranch();
-		const evalEntry = branch.findLast(
-			(entry) =>
-				entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "eval",
-		);
-		for (const entry of branch) {
-			if (entry.type !== "custom" || entry.customType !== TODO_SESSION_ENTRY_TYPE) continue;
-			expect(
-				(entry.data as { evidence: { entryId: string }[] }).evidence.some(
-					(evidence) => evidence.entryId === evalEntry?.id,
-				),
-			).toBe(false);
-		}
 	});
 
 	it("lets the Main TODO tool overwrite status to done and read it back", async () => {
@@ -719,61 +703,66 @@ describe("personal harness extension in an AgentSession", () => {
 		]);
 		await harness.session.prompt("Mark the task complete and read its status");
 		expect(JSON.parse(resultText(harness, "todo").at(-1)!)).toMatchObject({
-			items: [{ title: "Manual progress fixture", status: "done", completion: { kind: "manual" } }],
+			items: [{ title: "Manual progress fixture", status: "done" }],
+			progress: { done: 1, total: 1, inProgress: [] },
 		});
 	});
 
-	it("normalizes strict-model null optionals before applying background TODO updates", async () => {
+	it("uses Luna high with Fast Mode and accepts a reasonable background completion", async () => {
+		const todoCalls: Parameters<typeof modelCalls.completeHarnessTask>[0][] = [];
 		vi.spyOn(modelCalls, "completeHarnessTask").mockImplementation(async (options) => {
-			const input = JSON.parse(String(options.context.messages[0].content)) as {
-				currentTodo: { id: string }[];
-				observedEvidence: { entryId: string; outcome: string }[];
+			if (options.purpose !== "todo") throw new Error("Unexpected model purpose");
+			todoCalls.push(options);
+			const input = JSON.parse(String(options.context.messages[0]?.content)) as {
+				changes: { entryId: string; kind: string; summary: string }[];
+				currentTodo: { id: string; title: string; status: string }[];
 			};
-			const success = input.observedEvidence.find((evidence) => evidence.outcome === "success");
 			return fauxAssistantMessage(
 				[
 					fauxToolCall("return_todo_update", {
 						add: null,
-						update:
-							success && input.currentTodo[0]
-								? [
-										{
-											id: input.currentTodo[0].id,
-											title: null,
-											status: "done",
-											evidenceEntryIds: [success.entryId],
-										},
-									]
-								: null,
+						update: input.currentTodo[0] ? [{ id: input.currentTodo[0].id, title: null, status: "done" }] : null,
 					}),
 				],
 				{ stopReason: "toolUse" },
 			);
 		});
-		const harness = await create(dataDirectory(), {}, { todoDebounceMs: 1 });
+		const harness = await create(dataDirectory(), {}, { todoCheckIntervalMs: 1, todoModelUpdateIntervalMs: 10 });
 		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("todo", { action: "add", title: "Verify fixture" })], {
+			fauxAssistantMessage([fauxToolCall("todo", { action: "add", title: "Use current context" })], {
 				stopReason: "toolUse",
 			}),
-			fauxAssistantMessage(
-				[fauxToolCall("eval", { language: "javascript", code: "display(await tool.echo({text:'verified'}));" })],
-				{ stopReason: "toolUse" },
-			),
-			fauxAssistantMessage("done"),
+			fauxAssistantMessage("Added a progress item."),
 		]);
-		await harness.session.prompt("Verify the artificial fixture");
+		await harness.session.prompt("Keep a lightweight progress item");
 		await vi.waitFor(() =>
 			expect(
-				harness.sessionManager
-					.getBranch()
-					.some(
-						(entry) =>
-							entry.type === "custom" &&
-							entry.customType === TODO_SESSION_ENTRY_TYPE &&
-							(entry.data as { items: { status: string }[] }).items[0]?.status === "done",
-					),
+				harness.sessionManager.getBranch().some((entry) => {
+					if (entry.type !== "custom" || entry.customType !== TODO_SESSION_ENTRY_TYPE || !isRecord(entry.data))
+						return false;
+					if (!Array.isArray(entry.data.items)) return false;
+					const firstItem = entry.data.items[0];
+					return isRecord(firstItem) && firstItem.status === "done";
+				}),
 			).toBe(true),
 		);
+
+		const todoCall = todoCalls.findLast((options) => {
+			const input = JSON.parse(String(options.context.messages[0]?.content)) as { currentTodo: unknown[] };
+			return input.currentTodo.length > 0;
+		});
+		expect(todoCall).toMatchObject({
+			selection: { provider: "openai-codex", model: "gpt-6-luna", thinking: "high", fast: true },
+			purpose: "todo",
+		});
+		expect(todoCall?.context.systemPrompt).toContain(
+			"Mark done when the available work context reasonably indicates completion",
+		);
+		expect(todoCall?.context.systemPrompt).not.toContain("evidenceEntryIds");
+		expect(todoCall?.context.tools?.map((tool) => tool.name)).toEqual(["return_todo_update"]);
+		expect(JSON.stringify(todoCall?.context.tools?.[0]?.parameters)).not.toContain("evidenceEntryIds");
+		const input = JSON.parse(String(todoCall?.context.messages[0]?.content)) as Record<string, unknown>;
+		expect(Object.keys(input).sort()).toEqual(["changes", "currentTodo"]);
 	});
 
 	it("limits the first model tool surface while keeping permitted tools callable through eval", async () => {
@@ -934,49 +923,161 @@ describe("personal harness extension in an AgentSession", () => {
 		expect(JSON.parse(resultText(harness, "goal")[1])).toEqual({ status: "none" });
 	});
 
-	it("starts processing a newly persisted request before the parent agent_end event", async () => {
+	it("records the persisted request without waiting for the background TODO window", async () => {
 		const events: string[] = [];
-		const requestEntryIds: string[] = [];
-		vi.spyOn(modelCalls, "completeHarnessTask").mockImplementation(async (options) => {
-			const request = JSON.parse(String(options.context.messages[0]?.content)) as {
-				changes: { entryId: string; kind: string }[];
-			};
-			const requests = request.changes.filter((change) => change.kind === "request");
-			requestEntryIds.push(...requests.map((change) => change.entryId));
-			for (const change of requests) events.push(`todo:${change.entryId}`);
-			return fauxAssistantMessage([fauxToolCall("return_todo_update", { add: [], update: [] })], {
-				stopReason: "toolUse",
-			});
+		const todoUpdate = vi.spyOn(modelCalls, "completeHarnessTask").mockImplementation(async (options) => {
+			if (options.purpose === "todo") throw new Error("The TODO model must wait for its fixed update window");
+			return fauxAssistantMessage("Unexpected background model call");
 		});
-		const harness = await create(
-			dataDirectory(),
-			{
-				extensionFactories: [
-					(pi) => {
-						pi.on("message_persisted", async (event) => {
-							if (event.message.role !== "user") return;
-							events.push(`persisted:${event.entryId}`);
-							await vi.waitFor(() => expect(requestEntryIds).toContain(event.entryId));
-						});
-						pi.on("agent_end", () => {
-							events.push("agent_end");
-						});
-					},
-				],
-			},
-			{ todoDebounceMs: 0 },
-		);
+		const harness = await create(dataDirectory(), {
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_persisted", (event) => {
+						if (event.message.role === "user") events.push(`persisted:${event.entryId}`);
+					});
+					pi.on("agent_end", () => {
+						events.push("agent_end");
+					});
+				},
+			],
+		});
 		harness.setResponses([fauxAssistantMessage("done")]);
-
-		await harness.session.prompt("Track this request before answering");
+		await harness.session.prompt("Track this request without delaying the reply");
 
 		const userEntry = harness.sessionManager
 			.getBranch()
 			.find((entry) => entry.type === "message" && entry.message.role === "user");
 		expect(userEntry).toBeDefined();
 		if (!userEntry) throw new Error("User message was not persisted");
-		expect(requestEntryIds).toContain(userEntry.id);
-		expect(events.indexOf(`todo:${userEntry.id}`)).toBeLessThan(events.indexOf("agent_end"));
+		expect(events.indexOf(`persisted:${userEntry.id}`)).toBeLessThan(events.indexOf("agent_end"));
+		expect(todoUpdate).not.toHaveBeenCalled();
+	});
+
+	it("keeps main responses independent of TODO work and includes late canceled usage on session shutdown", async () => {
+		const pendingResponse = Promise.withResolvers<AssistantMessage>();
+		const updateStarted = Promise.withResolvers<{
+			signal: AbortSignal | undefined;
+			ledger: HarnessUsageLedger;
+		}>();
+		const lateResponse: AssistantMessage = {
+			...fauxAssistantMessage([fauxToolCall("return_todo_update", { add: [], update: [] })], {
+				stopReason: "toolUse",
+			}),
+			usage: {
+				input: 17,
+				output: 5,
+				cacheRead: 3,
+				cacheWrite: 2,
+				totalTokens: 27,
+				cost: { input: 0.17, output: 0.1, cacheRead: 0.03, cacheWrite: 0.02, total: 0.32 },
+			} satisfies Usage,
+		};
+		vi.spyOn(modelCalls, "completeHarnessTask").mockImplementation(async (options) => {
+			if (options.purpose !== "todo") throw new Error("Unexpected background model purpose");
+			updateStarted.resolve({ signal: options.signal, ledger: options.ledger });
+			const response = await pendingResponse.promise;
+			options.ledger.record({
+				purpose: "todo",
+				model: `${options.selection.provider}/${options.selection.model}`,
+				status: options.signal?.aborted ? "aborted" : "success",
+				usage: response.usage,
+				durationMs: 1,
+			});
+			if (options.signal?.aborted) throw new Error("Canceled model response settled late");
+			return response;
+		});
+
+		const harness = await create(dataDirectory(), {}, { todoCheckIntervalMs: 1, todoModelUpdateIntervalMs: 10 });
+		harness.setResponses([fauxAssistantMessage("main response")]);
+		let promptSettled = false;
+		const prompt = harness.session.prompt("Record this request in the background TODO");
+		void prompt.then(
+			() => {
+				promptSettled = true;
+			},
+			() => {
+				promptSettled = true;
+			},
+		);
+		let disposal: Promise<void> | undefined;
+		try {
+			const update = await updateStarted.promise;
+			await vi.waitFor(() => expect(promptSettled).toBe(true));
+			await prompt;
+			expect(update.signal?.aborted).toBe(false);
+
+			disposal = harness.session.dispose();
+			await vi.waitFor(() => expect(update.signal?.aborted).toBe(true));
+			let disposalSettled = false;
+			void disposal.then(() => {
+				disposalSettled = true;
+			});
+			await Promise.resolve();
+			expect(disposalSettled).toBe(false);
+
+			pendingResponse.resolve(lateResponse);
+			await disposal;
+			expect(update.ledger.snapshot().todo).toMatchObject({
+				calls: 1,
+				failed: 1,
+				unknownUsage: 0,
+				input: 17,
+				output: 5,
+				cacheRead: 3,
+				cacheWrite: 2,
+			});
+			expect(modelCalls.completeHarnessTask).toHaveBeenCalledTimes(1);
+			expect(
+				harness.sessionManager
+					.getBranch()
+					.some((entry) => entry.type === "custom" && entry.customType === TODO_SESSION_ENTRY_TYPE),
+			).toBe(false);
+		} finally {
+			pendingResponse.resolve(lateResponse);
+			await (disposal ?? harness.session.dispose());
+			await prompt.catch(() => undefined);
+		}
+	});
+
+	it("keeps the saved delta cursor before pending changes after shutdown retries a failed save", async () => {
+		let failTodoSave = true;
+		const harness = await create(dataDirectory());
+		const append = harness.sessionManager.appendCustomEntry.bind(harness.sessionManager);
+		vi.spyOn(harness.sessionManager, "appendCustomEntry").mockImplementation((customType, data) => {
+			if (customType === TODO_SESSION_ENTRY_TYPE && failTodoSave) {
+				failTodoSave = false;
+				throw new Error("synthetic TODO save failure");
+			}
+			return append(customType, data);
+		});
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("eval", {
+						language: "javascript",
+						code: 'display(await tool.todo({ action: "add", title: "Persist through shutdown" }));',
+					}),
+				],
+				{
+					stopReason: "toolUse",
+				},
+			),
+			fauxAssistantMessage("Added a lightweight TODO."),
+		]);
+		await harness.session.prompt("Add a TODO and keep its recent changes");
+		expect(failTodoSave).toBe(false);
+		await harness.session.dispose();
+
+		const branch = harness.sessionManager.getBranch();
+		const requestIndex = branch.findIndex((entry) => entry.type === "message" && entry.message.role === "user");
+		expect(requestIndex).toBeGreaterThanOrEqual(0);
+		const saved = branch.findLast((entry) => entry.type === "custom" && entry.customType === TODO_SESSION_ENTRY_TYPE);
+		expect(saved?.type).toBe("custom");
+		if (!saved || saved.type !== "custom" || !isRecord(saved.data))
+			throw new Error("Shutdown TODO resave was missing");
+		const expectedBoundary = requestIndex > 0 ? (branch[requestIndex - 1]?.id ?? null) : null;
+		expect(saved.data.processedThroughEntryId).toBe(expectedBoundary);
+		expect(saved.data.items).toMatchObject([{ title: "Persist through shutdown", status: "pending" }]);
 	});
 
 	it("replays pending user and tool results after restoring the saved TODO cursor", async () => {
@@ -1007,7 +1108,7 @@ describe("personal harness extension in an AgentSession", () => {
 					},
 				],
 			},
-			{ todoDebounceMs: 0 },
+			{ todoCheckIntervalMs: 1, todoModelUpdateIntervalMs: 10 },
 		);
 		harness.setResponses([
 			fauxAssistantMessage([fauxToolCall("echo", { text: "previous tool result" })], { stopReason: "toolUse" }),
