@@ -352,3 +352,41 @@ it("runs light compaction evaluation only when explicitly invoked", async () => 
 	);
 	expect(release).toHaveBeenCalledTimes(1);
 });
+
+it("injects lifecycle context without starting a model turn and keeps time after user input", async () => {
+	const handlers = new Map<string, Array<(event: unknown, context: ExtensionContext) => unknown>>();
+	const sendMessage = vi.fn();
+	const api = {
+		on: (name: string, handler: (event: unknown, context: ExtensionContext) => unknown) => {
+			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+		},
+		registerCommand: vi.fn(),
+		sendMessage,
+	} as unknown as ExtensionAPI;
+	const lifecycleContext = vi.fn((event: "session_start" | "session_compact") => `Lifecycle: ${event}`);
+	installHooks(api, {
+		evaluate: async () => {
+			throw new Error("not used");
+		},
+		hold: () => () => {},
+		ledger: new HarnessUsageLedger(),
+		lifecycleContext,
+		dynamicTurnContext: () => "Current time fixture",
+	});
+	const context = { sessionManager: { getHeader: () => null } } as unknown as ExtensionContext;
+	for (const name of ["session_start", "session_compact"]) await handlers.get(name)![0]({}, context);
+	expect(sendMessage.mock.calls).toEqual([
+		[
+			{ customType: "personal-harness-lifecycle-context", content: "Lifecycle: session_start", display: false },
+			{ triggerTurn: false },
+		],
+		[
+			{ customType: "personal-harness-lifecycle-context", content: "Lifecycle: session_compact", display: false },
+			{ triggerTurn: false },
+		],
+	]);
+	const turn = await handlers.get("before_agent_start")![0]({ systemPromptOptions: {} }, context);
+	expect(turn).toEqual({
+		message: { customType: "personal-harness-turn-context", content: "Current time fixture", display: false },
+	});
+});

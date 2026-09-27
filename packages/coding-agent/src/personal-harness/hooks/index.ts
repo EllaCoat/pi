@@ -42,6 +42,10 @@ export interface HarnessHookOptions {
 	ledger: HarnessUsageLedger;
 	childSystemPromptOptions?: ChildSystemPromptOptions;
 	dynamicTurnContext?: (now: Date, context: ExtensionContext) => string;
+	lifecycleContext?: (
+		event: "session_start" | "session_compact",
+		context: ExtensionContext,
+	) => string | undefined | Promise<string | undefined>;
 	timeZone?: string;
 	makeGoalSkillPath?: string;
 	additionalReadRoots?: readonly string[];
@@ -118,6 +122,20 @@ function appendFixedChildPrompt(
 }
 
 function installContinuity(pi: ExtensionAPI, options: HarnessHookOptions): void {
+	const injectContext = async (
+		event: "session_start" | "session_compact",
+		context: ExtensionContext,
+	): Promise<void> => {
+		const content = await options.lifecycleContext?.(event, context);
+		if (content?.trim())
+			pi.sendMessage(
+				{ customType: "personal-harness-lifecycle-context", content, display: false },
+				{ triggerTurn: false },
+			);
+	};
+	pi.on("session_start", (_event, context) => injectContext("session_start", context));
+	pi.on("session_compact", (_event, context) => injectContext("session_compact", context));
+
 	pi.registerCommand("make-goal", {
 		description: "Goalの起草を開始する。本文の承認前にはGoalを作成しない。",
 		handler: async (args, context) => {
