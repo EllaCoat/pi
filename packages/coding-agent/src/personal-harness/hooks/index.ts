@@ -6,11 +6,14 @@ import type { HarnessUsageLedger } from "../usage.ts";
 import { installModelCompactionHook } from "./compaction.ts";
 import {
 	applyContextProjection,
+	applyLegacyContextProjection,
 	CONTEXT_PRUNE_ENTRY,
+	type ContextCandidate,
 	collectContextCandidates,
 	contextTargetsFromBranch,
 	evaluateContextCandidates,
 	legacyProjection,
+	type ThinkingReplayCompatibility,
 } from "./context-prune.ts";
 import {
 	type AdviceResult,
@@ -51,6 +54,59 @@ export interface HarnessHookOptions {
 	makeGoalSkillPath?: string;
 	additionalReadRoots?: readonly string[];
 	compactModel?: HarnessModelSelection;
+}
+
+const VERIFIED_THINKING_PRUNE_COMPATIBILITY: readonly ThinkingReplayCompatibility[] = [
+	{ api: "openai-codex-responses", provider: "openai-codex", model: "gpt-6-luna" },
+	{ api: "openai-codex-responses", provider: "openai-codex", model: "gpt-6-sol" },
+	{ api: "openai-codex-responses", provider: "openai-codex", model: "gpt-6-astra" },
+];
+
+function projectionEntryIds(projection: {
+	entries: readonly { sourceEntry: { id: string }; messages: readonly unknown[] }[];
+	messages: readonly unknown[];
+}): string[] | undefined {
+	const entryIds: string[] = [];
+	let index = 0;
+	for (const entry of projection.entries) {
+		for (const message of entry.messages) {
+			if (projection.messages[index] !== message) return undefined;
+			entryIds.push(entry.sourceEntry.id);
+			index++;
+		}
+	}
+	return index === projection.messages.length ? entryIds : undefined;
+}
+
+function thinkingDestination(model: ExtensionContext["model"]): ThinkingReplayCompatibility | undefined {
+	return model ? { api: model.api, provider: model.provider, model: model.id } : undefined;
+}
+
+function snapshotHash(value: unknown): string | undefined {
+	try {
+		const serialized = JSON.stringify(value);
+		return typeof serialized === "string" ? createHash("sha256").update(serialized).digest("hex") : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function sameMessages(left: readonly unknown[], right: readonly unknown[]): boolean {
+	if (left.length !== right.length) return false;
+	return left.every((message, index) => snapshotHash(message) === snapshotHash(right[index]));
+}
+
+function targetReference(candidate: ContextCandidate): Record<string, unknown> {
+	return {
+		id: candidate.id,
+		entryId: candidate.entryId,
+		role: candidate.role,
+		blockIndex: candidate.blockIndex,
+		fingerprint: candidate.fingerprint,
+		kind: candidate.kind,
+		start: candidate.start,
+		end: candidate.end,
+	};
 }
 
 interface PendingInput {
@@ -355,7 +411,7 @@ function installInputAdvice(pi: ExtensionAPI, options: HarnessHookOptions): void
 	pi.on("session_compact_failed", () => cancelPending(enabled ? "not-run" : "disabled"));
 }
 
-function installLightCompact(pi: ExtensionAPI, options: HarnessHookOptions): void {
+function installJevCompact(pi: ExtensionAPI, options: HarnessHookOptions): void {
 	let active: AbortController | undefined;
 	const cancelActive = (): void => {
 		active?.abort();
@@ -364,20 +420,39 @@ function installLightCompact(pi: ExtensionAPI, options: HarnessHookOptions): voi
 
 	pi.on("context", (event, context) => {
 		const entries = context.sessionManager.getBranch();
-		const legacy = legacyProjection(event.messages, entries);
 		const targets = contextTargetsFromBranch(entries);
-		return { messages: applyContextProjection(legacy, targets) };
+		const projected = legacyProjection(event.messages, entries);
+		const legacyPruned = applyLegacyContextProjection(projected, targets);
+		const projection = context.sessionManager.buildSessionProjection();
+		const entryIds = projectionEntryIds(projection);
+		if (!entryIds) return { messages: legacyPruned };
+		const visibleIndexes = projection.messages.flatMap((message, index) =>
+			isRecord(message) && String(message.role) === "system" ? [] : [index],
+		);
+		const visibleMessages = visibleIndexes.map((index) => projection.messages[index]!);
+		const visibleEntryIds = visibleIndexes.map((index) => entryIds[index]);
+		const expected = legacyProjection(visibleMessages, entries);
+		if (!sameMessages(projected, expected)) return { messages: legacyPruned };
+		return {
+			messages: applyContextProjection(
+				projected,
+				visibleEntryIds,
+				targets,
+				thinkingDestination(context.model),
+				VERIFIED_THINKING_PRUNE_COMPATIBILITY,
+			),
+		};
 	});
 
 	onSessionNavigation(pi, cancelActive);
 	pi.on("session_before_compact", cancelActive);
 	pi.on("session_compact", cancelActive);
 	pi.on("session_compact_failed", cancelActive);
-	pi.registerCommand("light-compact", {
-		description: "作業文脈から不要なツール結果を選び、通常送信だけ固定markerへ間引きます。",
+	pi.registerCommand("jev-compact", {
+		description: "Jevが明示表示された履歴範囲を判定し、省略範囲を通常送信へ固定します。",
 		handler: async (args, context) => {
 			if (args.trim()) {
-				context.ui.notify("/light-compact は引数不要です。", "warning");
+				context.ui.notify("/jev-compact は引数不要です。", "warning");
 				return;
 			}
 			if (!context.isIdle() || context.hasPendingMessages()) {
@@ -385,20 +460,37 @@ function installLightCompact(pi: ExtensionAPI, options: HarnessHookOptions): voi
 				return;
 			}
 			if (active) {
-				context.ui.notify("別の/light-compact評価が進行中です。履歴は変更しません。", "warning");
+				context.ui.notify("別の/jev-compact評価が進行中です。履歴は変更しません。", "warning");
 				return;
 			}
 			const sessionId = context.sessionManager.getSessionId();
 			const leafId = context.sessionManager.getLeafId();
 			const entries = context.sessionManager.getBranch();
-			const messages = legacyProjection(context.sessionManager.buildSessionProjection().messages, entries);
+			const projection = context.sessionManager.buildSessionProjection();
+			const entryIds = projectionEntryIds(projection);
+			if (!entryIds) {
+				context.ui.notify("履歴の発言元を確認できないため、Jevへ送らず保持します。", "warning");
+				return;
+			}
 			const previousTargets = contextTargetsFromBranch(entries);
-			const gathered = collectContextCandidates(messages, previousTargets);
+			const messages = legacyProjection(projection.messages, entries);
+			const destination = thinkingDestination(context.model);
+			const gathered = collectContextCandidates(
+				messages,
+				entryIds,
+				previousTargets,
+				VERIFIED_THINKING_PRUNE_COMPATIBILITY,
+				destination,
+			);
 			if (!gathered.candidates.length) {
-				context.ui.notify(
-					"判定対象がありません。直近の結果・最新画像・読取/実行系・固有の証拠・既省略部分は保持します。",
-					"info",
-				);
+				context.ui.notify(`判定候補なし。Jev呼出しなし、保護${gathered.protected}範囲を保持します。`, "info");
+				return;
+			}
+			const branchHash = snapshotHash(entries);
+			const projectionHash = snapshotHash(messages);
+			const scopeHash = snapshotHash(gathered.candidates.map(targetReference));
+			if (!branchHash || !projectionHash || !scopeHash) {
+				context.ui.notify("判定前の履歴・範囲hashを確定できないため、Jevへ送らず保持します。", "warning");
 				return;
 			}
 			const controller = new AbortController();
@@ -409,51 +501,93 @@ function installLightCompact(pi: ExtensionAPI, options: HarnessHookOptions): voi
 				const signal = context.signal ? AbortSignal.any([controller.signal, context.signal]) : controller.signal;
 				const decision = await evaluateContextCandidates(
 					messages,
+					entryIds,
 					gathered.candidates,
 					options.evaluate,
 					signal,
 					previousTargets,
+					destination,
+					VERIFIED_THINKING_PRUNE_COMPATIBILITY,
 				);
+				const currentEntries = context.sessionManager.getBranch();
+				const currentProjection = context.sessionManager.buildSessionProjection();
+				const currentEntryIds = projectionEntryIds(currentProjection);
+				const currentMessages =
+					currentEntryIds === undefined ? [] : legacyProjection(currentProjection.messages, currentEntries);
+				const currentCandidates =
+					currentEntryIds === undefined
+						? []
+						: collectContextCandidates(
+								currentMessages,
+								currentEntryIds,
+								contextTargetsFromBranch(currentEntries),
+								VERIFIED_THINKING_PRUNE_COMPATIBILITY,
+								thinkingDestination(context.model),
+							).candidates;
 				const sameSnapshot =
 					context.sessionManager.getSessionId() === sessionId &&
 					context.sessionManager.getLeafId() === leafId &&
+					snapshotHash(currentEntries) === branchHash &&
+					snapshotHash(currentMessages) === projectionHash &&
+					snapshotHash(currentCandidates.map(targetReference)) === scopeHash &&
 					context.isIdle() &&
 					!context.hasPendingMessages();
 				if (signal.aborted || !sameSnapshot) {
 					context.ui.notify(
-						"評価中にsession・履歴・操作状態が変わったため、候補を適用しませんでした。",
+						"評価中にsession・branch・候補hashまたは操作状態が変わったため、結果を適用しませんでした。",
 						"warning",
 					);
 					return;
 				}
-				if (!decision.selected.length) {
-					context.ui.notify("Jevが不要と判断した部分はありません。履歴は変更しません。", "info");
-					return;
-				}
-				const targets = decision.selected.map(
-					({ callId, toolName, blockIndex, fingerprint, kind, start, end }) => ({
-						callId,
-						toolName,
-						blockIndex,
-						fingerprint,
-						kind,
-						start,
-						end,
-					}),
-				);
+				const targets = decision.selected.map(({ entryId, role, blockIndex, fingerprint, kind, start, end }) => ({
+					entryId,
+					role,
+					blockIndex,
+					fingerprint,
+					kind,
+					start,
+					end,
+				}));
+				const firstUnjudged = gathered.candidates[decision.unjudgedFrom];
+				const lastUnjudged = gathered.candidates[decision.unjudgedFrom + decision.unjudgedCount - 1];
 				pi.appendEntry(CONTEXT_PRUNE_ENTRY, {
-					version: 1,
+					version: 2,
 					sessionId,
 					sourceLeafId: leafId,
+					branchHash,
+					projectionHash,
+					scopeHash,
 					targets,
-					usage: { calls: decision.calls, inputTokens: decision.inputTokens, outputTokens: decision.outputTokens },
+					assessment: {
+						candidateCount: gathered.candidates.length,
+						protectedCount: gathered.protected,
+						evaluated: decision.evaluated,
+						kept: decision.kept,
+						omitted: targets.length,
+						uncertain: decision.uncertain,
+						unjudged: {
+							from: decision.unjudgedFrom,
+							count: decision.unjudgedCount,
+							firstCandidateId: firstUnjudged?.id ?? null,
+							lastCandidateId: lastUnjudged?.id ?? null,
+						},
+						usage: {
+							calls: decision.calls,
+							inputTokens: decision.inputTokens,
+							outputTokens: decision.outputTokens,
+							requestBytes: decision.requestBytes,
+						},
+					},
 				});
+				const unjudgedText = decision.unjudgedCount
+					? `; 未判定範囲 ${decision.unjudgedFrom + 1}-${decision.unjudgedFrom + decision.unjudgedCount} (${firstUnjudged?.id ?? "不明"}…${lastUnjudged?.id ?? "不明"})`
+					: "; 未判定範囲なし";
 				context.ui.notify(
-					`${targets.length}部分の省略を固定しました。原本は保持し、通常送信で再評価しません。Jev ${decision.calls}回、入力${decision.inputTokens} / 出力${decision.outputTokens} tokens。`,
+					`候補${gathered.candidates.length}・保護${gathered.protected}。Jev: 保持${decision.kept}、省略${targets.length}、判断不足${decision.uncertain}、未判定${decision.unjudgedCount}${unjudgedText}。${decision.calls}回、入力${decision.inputTokens}/出力${decision.outputTokens} tokens、要求${decision.requestBytes}B。判定範囲を固定し、原記録は保持します。`,
 					"info",
 				);
 			} catch {
-				context.ui.notify("判定を完了できませんでした。途中結果は適用せず、原本を保持します。", "warning");
+				context.ui.notify("判定を完了できませんでした。途中結果は適用せず、原記録を保持します。", "warning");
 			} finally {
 				release?.();
 				if (active === controller) active = undefined;
@@ -550,7 +684,7 @@ export function installHooks(pi: ExtensionAPI, options: HarnessHookOptions): voi
 	installContinuity(pi, options);
 	installInputAdvice(pi, options);
 	installReread(pi, options);
-	installLightCompact(pi, options);
+	installJevCompact(pi, options);
 	installModelCompactionHook(pi, {
 		hold: options.hold,
 		ledger: options.ledger,
