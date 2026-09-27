@@ -72,6 +72,37 @@ describe("buildSystemPrompt", () => {
 			);
 			expect(prompt).toContain("<cwd>\n/tmp\n</cwd>");
 		});
+
+		test("places leading sections after the base prompt and before project context", () => {
+			const prompt = buildSystemPrompt({
+				customPrompt: "Caller base.",
+				leadingSections: {
+					code_mode_tools: "Code Mode mapping.",
+					personal_harness: "Personal harness mapping.",
+				},
+				appendSystemPrompt: "Additional instructions.",
+				contextFiles: [{ path: "/tmp/AGENTS.md", content: "Project instructions." }],
+				sections: { extension_extra: "Other extension section." },
+				selectedTools: ["read"],
+				skills: [testSkill],
+				cwd: "/tmp",
+			});
+
+			expect(prompt.startsWith("Caller base.\n\n<code_mode_tools>")).toBe(true);
+			const positions = [
+				prompt.indexOf("<code_mode_tools>"),
+				prompt.indexOf("<personal_harness>"),
+				prompt.indexOf("<addendum>"),
+				prompt.indexOf("<project_context>"),
+				prompt.indexOf("<skills>"),
+				prompt.indexOf("<cwd>"),
+				prompt.indexOf("<extension_extra>"),
+			];
+			expect(positions).toEqual([...positions].sort((left, right) => left - right));
+			expect(prompt).toContain(
+				'<project_instructions path="/tmp/AGENTS.md">\nProject instructions.\n</project_instructions>',
+			);
+		});
 	});
 
 	describe("default tools", () => {
@@ -92,6 +123,22 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain("- bash:");
 			expect(prompt).toContain("- edit:");
 			expect(prompt).toContain("- write:");
+		});
+
+		test("lists visible tool definitions in name order without reordering inputs", () => {
+			const selectedTools = ["tool-z", "tool-a"];
+			const options = {
+				selectedTools,
+				toolSnippets: { "tool-z": "Z tool", "tool-a": "A tool" },
+				contextFiles: [],
+				skills: [],
+				cwd: "/tmp",
+			};
+			const prompt = buildSystemPrompt(options);
+
+			expect(prompt.indexOf("- tool-a: A tool")).toBeLessThan(prompt.indexOf("- tool-z: Z tool"));
+			expect(buildSystemPrompt(options)).toBe(prompt);
+			expect(selectedTools).toEqual(["tool-z", "tool-a"]);
 		});
 
 		test.each([

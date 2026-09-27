@@ -94,12 +94,16 @@ describe("personal harness Pi profile", () => {
 			mcpServers: { jev: { transport: { type: "stdio", command: "not-started-by-this-test" } } },
 		});
 		let systemPrompt = "";
+		let leadingSections: Record<string, string> = {};
+		let forceSystemPrompt: string | undefined;
 		harness = await createHarness({
 			extensionFactories: [
 				profile.extensionFactory,
 				(pi) => {
 					pi.on("before_agent_start", (event) => {
 						systemPrompt = event.systemPrompt;
+						leadingSections = { ...event.systemPromptOptions.leadingSections };
+						forceSystemPrompt = event.systemPromptOptions.forceSystemPrompt;
 					});
 				},
 			],
@@ -127,6 +131,10 @@ describe("personal harness Pi profile", () => {
 				.join("\n"),
 		).toContain("Fixture body.");
 		expect(systemPrompt).toContain("await tool.NAME(args)");
+		expect(Object.keys(leadingSections)).toEqual(["code_mode_tools", "personal_harness"]);
+		expect(leadingSections.personal_harness).toContain("Personal OMP profile tool mapping:");
+		expect(systemPrompt.indexOf("<code_mode_tools>")).toBeLessThan(systemPrompt.indexOf("<personal_harness>"));
+		expect(forceSystemPrompt).toBeUndefined();
 		expect(systemPrompt).toContain('await tool.mcp({action: "call"');
 		expect(systemPrompt).toContain('Configured aliases: ["jev"]');
 		expect(systemPrompt).toContain("await tool.skill_read({uri:");

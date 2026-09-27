@@ -3,6 +3,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionToolResult } from "../../src/core/extensions/types.ts";
+import { installCodeModeToolSurface } from "../../src/personal-harness/tool-surface.ts";
 import { createHarness, type Harness } from "../suite/harness.ts";
 
 const tinyBmp = (() => {
@@ -136,6 +137,45 @@ describe("Extension host-tool bridge", () => {
 		expect(
 			harness.session.messages.filter((message) => message.role === "toolResult").map((message) => message.toolName),
 		).toEqual(["bridge"]);
+	});
+
+	it("lists permitted tool definitions in deterministic name order", async () => {
+		let api: ExtensionAPI | undefined;
+		let firstIndex = "";
+		let repeatedIndex = "";
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					api = pi;
+					installCodeModeToolSurface(pi);
+					pi.registerTool({
+						name: "inspect_tools",
+						label: "inspect tools",
+						description: "Read the permitted tool index twice.",
+						parameters: Type.Object({}),
+						execute: async (_id, _input, signal) => {
+							const first = await api!.executeTool("tool_info", {}, { signal });
+							firstIndex = textOf(first.content);
+							const repeated = await api!.executeTool("tool_info", {}, { signal });
+							repeatedIndex = textOf(repeated.content);
+							return { content: [{ type: "text", text: "listed" }], details: {} };
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("inspect_tools", {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+
+		await harness.session.prompt("List the permitted tools.");
+
+		const tools = JSON.parse(firstIndex) as Array<{ name: string }>;
+		const names = tools.map((tool) => tool.name);
+		expect(names).toEqual([...names].sort());
+		expect(repeatedIndex).toBe(firstIndex);
 	});
 
 	it("passes cancellation to the active host tool and does not replay its side effect", async () => {

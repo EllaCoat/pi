@@ -138,6 +138,24 @@ describe("SDK tool visibility and persisted execution access", () => {
 		expect(getCurrentTools(requests.at(-1)!.messages).map((tool) => tool.name)).toEqual(["read"]);
 	});
 
+	it("keeps visible tool definitions in deterministic name order for an unsorted loadout", async () => {
+		work = mkdtempSync(join(tmpdir(), "pi-sdk-visible-order-"));
+		host = await createHarness();
+		const session = await create(SessionManager.inMemory(work), ["todo", "eval"]);
+		const requests: TranscriptContext[] = [];
+		host.setResponses([
+			(context) => {
+				requests.push(context);
+				return fauxAssistantMessage("ready");
+			},
+		]);
+
+		await session.prompt("Check the visible tool order.");
+
+		expect(getCurrentTools(requests[0]!.messages).map((tool) => tool.name)).toEqual(["eval", "todo"]);
+		expect(session.getActiveToolNames()).toEqual(["todo", "eval"]);
+	});
+
 	it("preserves disabled host tools across SDK resume, fork, and reload", async () => {
 		work = mkdtempSync(join(tmpdir(), "pi-sdk-loadout-"));
 		host = await createHarness();

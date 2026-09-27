@@ -282,26 +282,27 @@ describe("skills", () => {
 			expect(result).toContain("&quot;characters&quot;");
 		});
 
-		it("should format multiple skills", () => {
+		it("should format multiple skills in deterministic name order without reordering inputs", () => {
 			const skills: Skill[] = [
-				createTestSkill({
-					name: "skill-one",
-					description: "First skill.",
-					filePath: "/path/one/SKILL.md",
-					baseDir: "/path/one",
-				}),
 				createTestSkill({
 					name: "skill-two",
 					description: "Second skill.",
 					filePath: "/path/two/SKILL.md",
 					baseDir: "/path/two",
 				}),
+				createTestSkill({
+					name: "skill-one",
+					description: "First skill.",
+					filePath: "/path/one/SKILL.md",
+					baseDir: "/path/one",
+				}),
 			];
 
 			const result = formatSkillsForPrompt(skills);
 
-			expect(result).toContain("<name>skill-one</name>");
-			expect(result).toContain("<name>skill-two</name>");
+			expect(result.indexOf("<name>skill-one</name>")).toBeLessThan(result.indexOf("<name>skill-two</name>"));
+			expect(formatSkillsForPrompt(skills)).toBe(result);
+			expect(skills.map((skill) => skill.name)).toEqual(["skill-two", "skill-one"]);
 			expect((result.match(/<skill>/g) || []).length).toBe(2);
 		});
 

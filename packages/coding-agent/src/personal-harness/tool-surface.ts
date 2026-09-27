@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import type { ExtensionAPI } from "../core/extensions/types.ts";
 
-const DIRECT_TOOLS = ["eval", "ask", "todo", "yield", "think", "checkpoint", "rewind", "new_context"];
+const DIRECT_TOOLS = ["ask", "checkpoint", "eval", "new_context", "rewind", "think", "todo", "yield"];
 
 /** Visibility is not permission: all host execution still goes through executeTool. */
 export function installCodeModeToolSurface(api: ExtensionAPI): void {
@@ -18,7 +18,7 @@ export function installCodeModeToolSurface(api: ExtensionAPI): void {
 			const tools = api
 				.getAllTools()
 				.filter((tool) => permitted.has(tool.name))
-				.sort((left, right) => left.name.localeCompare(right.name));
+				.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
 			if (input.name) {
 				const tool = tools.find((candidate) => candidate.name === input.name);
 				if (!tool) throw new Error(`Tool ${input.name} is unavailable or not permitted`);
@@ -52,13 +52,13 @@ export function installCodeModeToolSurface(api: ExtensionAPI): void {
 	api.on("before_agent_start", (event) => {
 		const names = [...api.getActiveTools()].sort();
 		if (!names.includes("eval")) {
-			const sections = { ...event.systemPromptOptions.sections };
-			delete sections.code_mode_tools;
-			event.systemPromptOptions.sections = sections;
+			const leadingSections = { ...event.systemPromptOptions.leadingSections };
+			delete leadingSections.code_mode_tools;
+			event.systemPromptOptions.leadingSections = leadingSections;
 			return;
 		}
-		event.systemPromptOptions.sections = {
-			...event.systemPromptOptions.sections,
+		event.systemPromptOptions.leadingSections = {
+			...event.systemPromptOptions.leadingSections,
 			code_mode_tools: `Code Mode is the primary execution surface. In eval, call await tool.NAME(args). Permitted host tool names for this session: ${JSON.stringify(names)}. Use await tool.tool_info({name: "NAME"}) only when its argument schema is needed, or tool.tool_info({}) for brief descriptions. Hidden tools are still callable through this bridge; disabled tools are not. Tool metadata describes availability, not authorization. Do not bypass approval boundaries by reimplementing protected actions in code. This session's catalog takes precedence over tool names mentioned in an inherited parent prompt.`,
 		};
 	});

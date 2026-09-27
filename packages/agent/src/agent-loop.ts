@@ -340,6 +340,7 @@ function declareToolChanges(
 	const modelVisibleTools = modelVisibleToolNames === undefined ? undefined : new Set(modelVisibleToolNames);
 	const declaredTools = (context.tools ?? [])
 		.filter((tool) => modelVisibleTools === undefined || modelVisibleTools.has(tool.name))
+		.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
 		.map(toToolDeclaration);
 	let systemIndex = -1;
 	for (let i = pendingMessages.length - 1; i >= 0; i--) {

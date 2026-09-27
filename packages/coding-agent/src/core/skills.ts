@@ -353,7 +353,9 @@ function loadSkillFromFile(
  * (they can only be invoked explicitly via /skill:name commands).
  */
 export function formatSkillsForPrompt(skills: Skill[], fileReadTool: "read" | "bash" = "read"): string {
-	const visibleSkills = skills.filter((s) => !s.disableModelInvocation);
+	const visibleSkills = skills
+		.filter((s) => !s.disableModelInvocation)
+		.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
 
 	if (visibleSkills.length === 0) {
 		return "";

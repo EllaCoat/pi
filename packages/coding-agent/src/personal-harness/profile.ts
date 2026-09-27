@@ -118,13 +118,19 @@ export function createPersonalHarnessProfile(options: PersonalHarnessProfileOpti
 	const skillPaths = [...new Set(inputSkillPaths.map((path) => resolvePath(path, process.cwd(), { trim: true })))];
 	const loaded = loadSkills({ cwd: process.cwd(), agentDir: process.cwd(), skillPaths, includeDefaults: false });
 	const serverNames = Object.keys(options.mcpServers ?? {}).sort();
-	const harnessExtension = createPersonalHarnessExtension({ ...extensionOptions, inheritedSkillPaths: skillPaths });
+	const harnessExtension = createPersonalHarnessExtension({
+		...extensionOptions,
+		inheritedSkillPaths: skillPaths,
+	});
 	const extensionFactory: ExtensionFactory = (pi) => {
 		harnessExtension(pi);
 		registerSkillReadTool(pi, loaded.skills);
-		pi.on("before_agent_start", (event) => ({
-			systemPrompt: `${event.systemPrompt}\n\n${profileInstructions(serverNames)}`,
-		}));
+		pi.on("before_agent_start", (event) => {
+			event.systemPromptOptions.leadingSections = {
+				...event.systemPromptOptions.leadingSections,
+				personal_harness: profileInstructions(serverNames),
+			};
+		});
 	};
 	const resourceLoaderOptions: PersonalHarnessResourceOptions = {
 		additionalSkillPaths: skillPaths,
