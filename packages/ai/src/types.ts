@@ -437,6 +437,8 @@ export interface Usage {
 		cacheRead: number;
 		cacheWrite: number;
 		total: number;
+		/** Whether this cost was calculated from known prices; omitted means unknown provenance. */
+		known?: boolean;
 	};
 }
 
@@ -1031,6 +1033,8 @@ export interface ModelCostTier extends ModelCostRates {
 }
 
 export interface ModelCost extends ModelCostRates {
+	/** Whether rates are known. Omitted means known for existing catalog models. */
+	known?: boolean;
 	/** Request-wide pricing tiers. The highest matching input threshold applies to the full request. */
 	tiers?: ModelCostTier[];
 }

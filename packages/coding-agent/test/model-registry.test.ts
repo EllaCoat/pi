@@ -254,6 +254,71 @@ describe("ModelRegistry", () => {
 			expect(model).toBeDefined();
 			expect(model?.api).toBe("openai-completions");
 			expect(model?.baseUrl).toBe("https://openrouter.ai/api/v1");
+			expect(model?.cost.known).toBe(false);
+		});
+
+		test("treats explicitly zero-priced custom models as known free", async () => {
+			writeRawModelsJson({
+				openrouter: {
+					models: [
+						{
+							id: "fake-provider/free-model",
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						},
+					],
+				},
+			});
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.find("openrouter", "fake-provider/free-model")?.cost).toMatchObject({
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				known: true,
+			});
+		});
+
+		test("keeps missing-rate provenance through a partial model override", async () => {
+			writeRawModelsJson({
+				openrouter: {
+					models: [{ id: "fake-provider/partial-cost", input: ["text"] }],
+					modelOverrides: { "fake-provider/partial-cost": { cost: { input: 1 } } },
+				},
+			});
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.find("openrouter", "fake-provider/partial-cost")?.cost).toMatchObject({
+				input: 1,
+				output: 0,
+				known: false,
+			});
+		});
+
+		test("treats complete zero-rate overrides as known free", async () => {
+			writeRawModelsJson({
+				openrouter: {
+					models: [{ id: "fake-provider/override-free", input: ["text"] }],
+					modelOverrides: {
+						"fake-provider/override-free": {
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						},
+					},
+				},
+			});
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.find("openrouter", "fake-provider/override-free")?.cost).toMatchObject({
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				known: true,
+			});
 		});
 
 		test("non-built-in provider custom models still require baseUrl", async () => {

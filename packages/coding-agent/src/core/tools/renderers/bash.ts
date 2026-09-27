@@ -22,7 +22,7 @@ type BashResultRenderState = {
 	cachedLines: string[] | undefined;
 	cachedSkipped: number | undefined;
 };
-class BashResultRenderComponent extends Container {
+export class BashResultRenderComponent extends Container {
 	state: BashResultRenderState = {
 		cachedWidth: undefined,
 		cachedLines: undefined,

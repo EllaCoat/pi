@@ -3158,13 +3158,14 @@ export class AgentSession {
 						});
 					});
 				},
-				appendEntry: (customType, data) => {
-					const entryId = this.sessionManager.appendCustomEntry(customType, data);
+				appendEntry: (customType, data, options) => {
+					const entryId = this.sessionManager.appendCustomEntry(customType, data, options);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
 						this._emit({ type: "entry_appended", entry });
 					}
 				},
+
 				setSessionName: (name) => {
 					this.setSessionName(name);
 				},

@@ -1547,8 +1547,10 @@ export interface ExtensionAPI {
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): void;
 
-	/** Append a custom entry to the session for state persistence (not sent to LLM). */
-	appendEntry<T = unknown>(customType: string, data?: T): void;
+	/** Append a custom entry for state persistence (not sent to LLM).
+	 * An explicit parent keeps the active leaf unchanged.
+	 */
+	appendEntry<T = unknown>(customType: string, data?: T, options?: { parentId: string | null }): void;
 
 	// =========================================================================
 	// Session Metadata
@@ -1848,7 +1850,11 @@ export type SendUserMessageHandler = (
 	options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 ) => void;
 
-export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
+export type AppendEntryHandler = <T = unknown>(
+	customType: string,
+	data?: T,
+	options?: { parentId: string | null },
+) => void;
 
 export type SetSessionNameHandler = (name: string) => void;
 

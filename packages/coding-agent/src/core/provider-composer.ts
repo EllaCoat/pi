@@ -161,6 +161,12 @@ function mergeInputLimits(
 }
 
 function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride): Model<Api> {
+	const allRatesOverridden =
+		override.cost?.input !== undefined &&
+		override.cost.output !== undefined &&
+		override.cost.cacheRead !== undefined &&
+		override.cost.cacheWrite !== undefined;
+	const costKnown = allRatesOverridden ? true : model.cost.known;
 	return {
 		...model,
 		name: override.name ?? model.name,
@@ -176,6 +182,7 @@ function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride
 					output: override.cost.output ?? model.cost.output,
 					cacheRead: override.cost.cacheRead ?? model.cost.cacheRead,
 					cacheWrite: override.cost.cacheWrite ?? model.cost.cacheWrite,
+					...(costKnown === undefined ? {} : { known: costKnown }),
 					tiers: override.cost.tiers ?? model.cost.tiers,
 				}
 			: model.cost,
@@ -219,7 +226,9 @@ function modelFromJson(
 		thinkingLevelMap: definition.thinkingLevelMap,
 		input: (definition.input ?? ["text"]) as ("text" | "image")[],
 		inputLimits: definition.inputLimits,
-		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		cost: definition.cost
+			? { ...definition.cost, known: true }
+			: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, known: false },
 		promptCache: definition.promptCache,
 		contextWindow: definition.contextWindow ?? 128000,
 		maxTokens: definition.maxTokens ?? 16384,

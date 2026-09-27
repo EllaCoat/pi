@@ -99,6 +99,7 @@ import {
 	resolveModelScopeFromModels,
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
+import { OpenAICodexUsageController } from "../../core/openai-codex-usage.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
@@ -436,6 +437,9 @@ export class InteractiveMode {
 	private footer: FooterComponent;
 	private footerContainer: Container;
 	private footerDataProvider: FooterDataProvider;
+	private openAIUsageController: OpenAICodexUsageController | undefined;
+	private openAIUsageSession: AgentSession | undefined;
+	private openAIUsageTimer: NodeJS.Timeout | undefined;
 	// Stored so the same manager can be injected into custom editors, selectors, and extension UI.
 	private keybindings: KeybindingsManager;
 	private version: string;
@@ -4409,6 +4413,7 @@ export class InteractiveMode {
 				this.showStatus(msg);
 			} else {
 				this.footer.invalidate();
+				this.refreshOpenAIUsage();
 				this.updateEditorBorderColor();
 				const thinkingStr =
 					result.model.reasoning && result.thinkingLevel !== "off" ? ` (thinking: ${result.thinkingLevel})` : "";
@@ -4439,7 +4444,7 @@ export class InteractiveMode {
 				}
 			}
 		}
-		this.showStatus(`Tool output: ${expanded ? "expanded" : "collapsed"}`);
+		this.showStatus(`Tool input/output: ${expanded ? "expanded" : "collapsed"}`);
 	}
 
 	/** Update rendered assistant messages without rebuilding live tool components. */
@@ -5068,6 +5073,7 @@ export class InteractiveMode {
 			try {
 				await this.session.setModel(model, { persist: false });
 				this.footer.invalidate();
+				this.refreshOpenAIUsage();
 				this.updateEditorBorderColor();
 				this.showStatus(`Model: ${model.id}`);
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
@@ -5115,6 +5121,35 @@ export class InteractiveMode {
 		return findExactModelReferenceMatch(searchTerm, [...this.session.modelRuntime.getAvailableSnapshot()]);
 	}
 
+	private refreshOpenAIUsage(invalidate = false): void {
+		if (!this.isInitialized || this.isShuttingDown || /^(1|true|yes)$/i.test(process.env.PI_OFFLINE ?? "")) return;
+		const session = this.session;
+		if (!this.openAIUsageController || this.openAIUsageSession !== session) {
+			this.openAIUsageController?.dispose();
+			this.openAIUsageController = new OpenAICodexUsageController(session.modelRuntime);
+			this.openAIUsageSession = session;
+		}
+		const controller = this.openAIUsageController;
+		controller.setContext({
+			sessionId: session.sessionId,
+			providerId: session.model?.provider ?? "",
+			modelId: session.model?.id ?? "",
+		});
+		if (invalidate) controller.invalidate();
+		const pending = controller.refresh();
+		this.footer.setOpenAIUsage(controller.getSnapshot());
+		this.ui.requestRender();
+		void pending.then(() => {
+			if (this.openAIUsageController !== controller || this.session !== session || !this.isInitialized) return;
+			this.footer.setOpenAIUsage(controller.getSnapshot());
+			this.ui.requestRender();
+		});
+		if (!this.openAIUsageTimer) {
+			this.openAIUsageTimer = setInterval(() => this.refreshOpenAIUsage(), 60_000);
+			this.openAIUsageTimer.unref();
+		}
+	}
+
 	/** Update the footer's available provider count from the current snapshot without refreshing catalogs. */
 	private updateAvailableProviderCount(): void {
 		const models =
@@ -5123,6 +5158,7 @@ export class InteractiveMode {
 				: this.session.modelRuntime.getAvailableSnapshot();
 		const uniqueProviders = new Set(models.map((model) => model.provider));
 		this.footerDataProvider.setAvailableProviderCount(uniqueProviders.size);
+		this.refreshOpenAIUsage();
 	}
 
 	private async maybeWarnAboutAnthropicSubscriptionAuth(
@@ -5879,6 +5915,7 @@ export class InteractiveMode {
 						await this.session.modelRuntime.logout(providerOption.id, {
 							signal: AbortSignal.timeout(15_000),
 						});
+						this.refreshOpenAIUsage(providerOption.id === "openai-codex");
 						await this.updateAvailableProviderCount();
 						const message =
 							providerOption.authType === "oauth"
@@ -5909,6 +5946,7 @@ export class InteractiveMode {
 		authType: "oauth" | "api_key",
 		previousModel: Model<any> | undefined,
 	): Promise<void> {
+		this.refreshOpenAIUsage(providerId === "openai-codex");
 		const actionLabel = authType === "oauth" ? `Logged in to ${providerName}` : `Saved API key for ${providerName}`;
 
 		const session = this.session;
@@ -6865,6 +6903,11 @@ export class InteractiveMode {
 		this.clearStatusIndicator();
 		this.themeController.disableAutoSync();
 		this.clearExtensionTerminalInputListeners();
+		if (this.openAIUsageTimer) clearInterval(this.openAIUsageTimer);
+		this.openAIUsageTimer = undefined;
+		this.openAIUsageController?.dispose();
+		this.openAIUsageController = undefined;
+		this.openAIUsageSession = undefined;
 		this.footer.dispose();
 		this.footerDataProvider.dispose();
 		if (this.unsubscribe) {

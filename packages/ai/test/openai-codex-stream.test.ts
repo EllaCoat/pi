@@ -50,10 +50,12 @@ function decodeCodexRequestBody(body: RequestInit["body"] | undefined): Record<s
 function buildSSEPayload({
 	status,
 	includeDone = false,
+	includeUsage = true,
 	endTurn,
 }: {
 	status: "completed" | "incomplete";
 	includeDone?: boolean;
+	includeUsage?: boolean;
 	endTurn?: boolean;
 }): string {
 	const terminalType = status === "incomplete" ? "response.incomplete" : "response.completed";
@@ -80,12 +82,16 @@ function buildSSEPayload({
 				status,
 				end_turn: endTurn,
 				incomplete_details: status === "incomplete" ? { reason: "max_output_tokens" } : null,
-				usage: {
-					input_tokens: 5,
-					output_tokens: 3,
-					total_tokens: 8,
-					input_tokens_details: { cached_tokens: 0 },
-				},
+				...(includeUsage
+					? {
+							usage: {
+								input_tokens: 5,
+								output_tokens: 3,
+								total_tokens: 8,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						}
+					: {}),
 			},
 		})}`,
 	];
@@ -212,6 +218,7 @@ describe("openai-codex streaming", () => {
 			if (event.type === "done") {
 				sawDone = true;
 				expect(event.message.content.find((c) => c.type === "text")?.text).toBe("Hello");
+				expect(event.message.usage.cost.known).toBe(true);
 			}
 		}
 
@@ -256,6 +263,38 @@ describe("openai-codex streaming", () => {
 
 		expect(result.stopReason).toBe("stop");
 		expect(result.content.find((content) => content.type === "text")?.text).toBe("Hello");
+	});
+
+	it("leaves cost provenance unknown when a Codex Responses completion omits usage", async () => {
+		const token = mockToken();
+		const sse = buildSSEPayload({ status: "completed", includeUsage: false });
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context = normalizeContext({
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		});
+
+		const result = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "sse",
+			fetch: async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		}).result();
+
+		expect(result.content.find((content) => content.type === "text")?.text).toBe("Hello");
+		expect(result.usage.totalTokens).toBe(0);
+		expect(result.usage.cost.total).toBe(0);
+		expect(result.usage.cost.known).toBeUndefined();
 	});
 
 	it("completes after response.completed even when the SSE body stays open", async () => {
