@@ -79,7 +79,7 @@ describe("context handlers and system messages", () => {
 		const request = getRequest();
 		expect(seen.at(-1)?.some((message) => message.role === "system")).toBe(false);
 		expect(request.messages[0]?.role).toBe("system");
-		expect(toolNames(request)).toEqual(harness.session.getActiveToolNames());
+		expect(toolNames(request)).toEqual(harness.session.getActiveToolNames().toSorted());
 		expect(getCurrentSystemPrompt(request.messages)).toBe(harness.session.systemPrompt);
 		expect(request.messages.filter((message) => message.role === "system")).toHaveLength(1);
 	});
@@ -129,7 +129,7 @@ describe("context handlers and system messages", () => {
 
 		const request = getRequest();
 		expect(request.messages.map((message) => message.role)).toEqual(["system", "user", "user"]);
-		expect(toolNames(request)).toEqual(harness.session.getActiveToolNames());
+		expect(toolNames(request)).toEqual(harness.session.getActiveToolNames().toSorted());
 	});
 
 	it("keeps system messages a handler adds after the replayed head", async () => {
@@ -149,7 +149,7 @@ describe("context handlers and system messages", () => {
 
 		const request = getRequest();
 		expect(request.messages.map((message) => message.role)).toEqual(["system", "system", "user"]);
-		expect(toolNames(request)).toEqual(harness.session.getActiveToolNames());
+		expect(toolNames(request)).toEqual(harness.session.getActiveToolNames().toSorted());
 		expect(getCurrentSystemPrompt(request.messages)).toContain(harness.session.systemPrompt);
 		expect(getCurrentSystemPrompt(request.messages)).toContain("ephemeral reminder");
 	});
@@ -196,7 +196,12 @@ describe("context_with_system handlers", () => {
 		expect(input?.[0]?.role).toBe("system");
 		expect(input?.[1]?.role).toBe("compactionSummary");
 		expect(harness.session.getActiveToolNames()).toContain("bash");
-		expect(toolNames(getRequest())).toEqual(harness.session.getActiveToolNames().filter((name) => name !== "bash"));
+		expect(toolNames(getRequest())).toEqual(
+			harness.session
+				.getActiveToolNames()
+				.filter((name) => name !== "bash")
+				.toSorted(),
+		);
 	});
 
 	it("reports a handler that drops the leading system message but honors its output", async () => {

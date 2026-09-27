@@ -14,7 +14,7 @@ function run(command, args, options = {}) {
 	console.log(`$ ${[command, ...args].join(" ")}`);
 	const result = spawnSync(command, args, {
 		encoding: "utf8",
-		shell: process.platform === "win32",
+		shell: process.platform === "win32" && (command === "npm" || /\.(?:cmd|bat)$/i.test(command)),
 		timeout: 300_000,
 		...options,
 	});

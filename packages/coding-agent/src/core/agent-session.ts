@@ -50,6 +50,7 @@ import {
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
+import { HarnessToolDispatcher } from "../personal-harness/dispatcher.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { processImage } from "../utils/image-process.ts";
 import { sleep } from "../utils/sleep.ts";
@@ -92,6 +93,7 @@ import {
 	type SessionBeforeTreeResult,
 	type SessionBoundaryDraft,
 	type SessionCompactFailedEvent,
+	type SessionShutdownEvent,
 	type SessionStartEvent,
 	type ShutdownHandler,
 	type ToolDefinition,
@@ -338,8 +340,10 @@ export class AgentSession {
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
+	#disposePromise?: Promise<void>;
 	private _isAgentRunActive = false;
 	private _agentRunAbortRequested = false;
+	private _promptAbortGeneration = 0;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -401,6 +405,7 @@ export class AgentSession {
 
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
+	#toolDispatcher: HarnessToolDispatcher | undefined;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -942,9 +947,15 @@ export class AgentSession {
 				// Regular LLM message - persist as SessionMessageEntry
 				entryId = this.sessionManager.appendMessage(event.message);
 			}
-			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
-
+			if (entryId) {
+				this._entryIdsByMessage.set(event.message, entryId);
+				await this._extensionRunner.emit({
+					type: "message_persisted",
+					entryId,
+					message: event.message,
+				});
+			}
 			if (event.message.role === "assistant") {
 				const assistantMsg = event.message as AssistantMessage;
 				this._lastAssistantMessage = assistantMsg;
@@ -1160,6 +1171,8 @@ export class AgentSession {
 
 	/** Disconnect from agent events during disposal. */
 	private _disconnectFromAgent(): void {
+		this.#toolDispatcher?.close();
+		this.#toolDispatcher = undefined;
 		if (this._unsubscribeAgent) {
 			this._unsubscribeAgent();
 			this._unsubscribeAgent = undefined;
@@ -1170,27 +1183,52 @@ export class AgentSession {
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	dispose(): void {
-		try {
-			this.abortRetry();
-			this.abortCompaction();
-			this.abortBranchSummary();
-			this.abortBash();
-			this.agent.abort();
-		} catch {
-			// Dispose must succeed even if an abort hook throws.
-		}
+	dispose(
+		options: {
+			reason?: SessionShutdownEvent["reason"];
+			targetSessionFile?: string;
+			beforeInvalidate?: () => void;
+		} = {},
+	): Promise<void> {
+		if (this.#disposePromise) return this.#disposePromise;
+		this.#disposePromise = (async () => {
+			try {
+				this.abortRetry();
+				this.abortCompaction();
+				this.abortBranchSummary();
+				this.abortBash();
+				await this.abort();
+			} catch {
+				// Continue cleanup even if abort listeners fail.
+			}
 
-		this._extensionRunner.invalidate(
-			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
-		);
-		this._disconnectFromAgent();
-		this._eventListeners = [];
-		if (this._cacheWarmer) {
-			this._cacheWarmer.onWarmed = undefined;
-			this._cacheWarmer.cancel();
-		}
-		cleanupSessionResources(this.sessionId);
+			const reason = options.reason ?? "quit";
+			const includeTarget =
+				options.targetSessionFile !== undefined || reason === "new" || reason === "resume" || reason === "fork";
+			try {
+				await emitSessionShutdownEvent(this._extensionRunner, {
+					type: "session_shutdown",
+					reason,
+					...(includeTarget ? { targetSessionFile: options.targetSessionFile } : {}),
+				});
+			} finally {
+				try {
+					options.beforeInvalidate?.();
+				} finally {
+					this._extensionRunner.invalidate(
+						"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+					);
+					this._disconnectFromAgent();
+					this._eventListeners = [];
+					if (this._cacheWarmer) {
+						this._cacheWarmer.onWarmed = undefined;
+						this._cacheWarmer.cancel();
+					}
+					cleanupSessionResources(this.sessionId);
+				}
+			}
+		})();
+		return this.#disposePromise;
 	}
 
 	// =========================================================================
@@ -1240,7 +1278,8 @@ export class AgentSession {
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
-		return buildSystemPrompt(this._runSystemPromptOptions ?? this._baseSystemPromptOptions);
+		const options = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
+		return buildSystemPrompt({ ...options, modelVisibleTools: this.getModelVisibleTools() });
 	}
 
 	/** Current retry attempt (0 if not retrying) */
@@ -1254,6 +1293,17 @@ export class AgentSession {
 	 */
 	getActiveToolNames(): string[] {
 		return this.agent.state.tools.map((t) => t.name);
+	}
+
+	/** Names configured for model declaration, or undefined to expose every active tool. */
+	getModelVisibleTools(activeToolNames?: readonly string[]): string[] | undefined {
+		return this.agent.getModelVisibleTools(activeToolNames);
+	}
+
+	/** Filter model-facing declarations and prompt guidance without changing execution access. */
+	setModelVisibleTools(toolNames: Parameters<Agent["setModelVisibleTools"]>[0]): void {
+		this.agent.setModelVisibleTools(toolNames);
+		this._rebuildSystemPrompt(this.getActiveToolNames());
 	}
 
 	/**
@@ -1411,14 +1461,27 @@ export class AgentSession {
 		options: NormalizedBuildSystemPromptOptions,
 		messages: AgentMessage[] = this.agent.state.messages,
 	): SystemMessage | undefined {
-		options.selectedTools = [...new Set(options.selectedTools)].filter((name) => this._toolRegistry.has(name));
-		this.agent.state.tools = options.selectedTools.flatMap((name) => {
+		const activeToolNames = [...new Set(options.selectedTools)].filter((name) => this._toolRegistry.has(name));
+		this.agent.state.tools = activeToolNames.flatMap((name) => {
 			const tool = this._toolRegistry.get(name);
 			return tool ? [tool] : [];
 		});
+		options.selectedTools = activeToolNames;
+		this._baseSystemPromptOptions.selectedTools = activeToolNames.slice();
+		const savedLoadout = this.sessionManager
+			.getBranch()
+			.findLast((entry) => entry.type === "custom" && entry.customType === "active_tool_loadout_v1");
+		const savedNames = savedLoadout?.type === "custom" ? savedLoadout.data : undefined;
+		if (
+			!Array.isArray(savedNames) ||
+			savedNames.length !== activeToolNames.length ||
+			savedNames.some((name, index) => name !== activeToolNames[index])
+		) {
+			this.sessionManager.appendCustomEntry("active_tool_loadout_v1", activeToolNames);
+		}
 		const sections = diffSystemPromptSections(
 			getCurrentSystemMessage(messages)?.sections ?? {},
-			buildSystemPromptSections(options),
+			buildSystemPromptSections({ ...options, modelVisibleTools: this.getModelVisibleTools() }),
 		);
 		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
 	}
@@ -1452,11 +1515,17 @@ export class AgentSession {
 
 	/** Restore the active tool loadout declared by the session transcript, if it declares one. */
 	private _restoreToolsFromTranscript(): void {
+		const savedLoadout = this.sessionManager
+			.getBranch()
+			.findLast((entry) => entry.type === "custom" && entry.customType === "active_tool_loadout_v1");
+		const savedNames = savedLoadout?.type === "custom" ? savedLoadout.data : undefined;
 		const current = getCurrentSystemMessage(this.sessionManager.buildSessionContext().messages);
-		if (!current) return;
-		const toolNames = (current.toolsAdded ?? [])
-			.map((tool) => tool.name)
-			.filter((name) => this._toolRegistry.has(name));
+		if (!current && !Array.isArray(savedNames)) return;
+		const names =
+			Array.isArray(savedNames) && savedNames.every((name): name is string => typeof name === "string")
+				? savedNames
+				: (current?.toolsAdded ?? []).map((tool) => tool.name);
+		const toolNames = names.filter((name) => this._toolRegistry.has(name));
 		this.agent.state.tools = toolNames.flatMap((name) => {
 			const registered = this._toolRegistry.get(name);
 			return registered ? [registered] : [];
@@ -1613,6 +1682,12 @@ export class AgentSession {
 		}
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
+		const abortGeneration = this._promptAbortGeneration;
+		const wasCancelled = (): boolean => {
+			if (abortGeneration === this._promptAbortGeneration) return false;
+			preflightResult?.("handled");
+			return true;
+		};
 		// Handle extension commands first (execute immediately, even during streaming)
 		// Extension commands manage their own LLM interaction via pi.sendMessage()
 		if (expandPromptTemplates && text.startsWith("/")) {
@@ -1697,23 +1772,19 @@ export class AgentSession {
 			await this._checkCompaction(lastAssistant, false);
 		}
 
+		if (wasCancelled()) return;
+
 		// Emit before_agent_start before normalizing images so extension-driven model
 		// selection determines the resize profile used for the request and history.
-		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
 		const result = await this._extensionRunner.emitBeforeAgentStart(
 			expandedText,
 			currentImages,
 			this._baseSystemPromptOptions,
+			currentText,
 		);
-		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
-		// which updates the live loadout instead. An explicit edit wins; otherwise the live
-		// loadout is authoritative, so a setActiveTools() call is not undone here.
-		const handlerEditedTools =
-			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
-			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
-		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
-
+		if (wasCancelled()) return;
 		const normalized = await this._normalizePromptImages(currentImages);
+		if (wasCancelled()) return;
 		const userText = normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
 		// Build messages only after hooks and image normalization have completed.
@@ -2073,6 +2144,7 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		this._promptAbortGeneration++;
 		if (this._isAgentRunActive) {
 			this._agentRunAbortRequested = true;
 		}
@@ -2081,7 +2153,13 @@ export class AgentSession {
 		this.abortBranchSummary();
 		if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
 		this.agent.abort();
-		await this.waitForIdle();
+		try {
+			if (this._extensionRunner.hasHandlers("session_abort")) {
+				await this._extensionRunner.emit({ type: "session_abort" });
+			}
+		} finally {
+			await this.waitForIdle();
+		}
 	}
 
 	async waitForIdle(): Promise<void> {
@@ -3018,6 +3096,23 @@ export class AgentSession {
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
+		this.#toolDispatcher?.close();
+		const toolDispatcher = new HarnessToolDispatcher({
+			tools: () => this.agent.state.tools,
+			context: () => ({
+				messages: this.agent.state.messages.slice(),
+				tools: this.agent.state.tools.slice(),
+			}),
+			assistantMessage: () => {
+				if (!this._lastAssistantMessage) {
+					throw new Error("Cannot execute a host tool without an active assistant message");
+				}
+				return this._lastAssistantMessage;
+			},
+			beforeToolCall: this.agent.beforeToolCall,
+			afterToolCall: this.agent.afterToolCall,
+		});
+		this.#toolDispatcher = toolDispatcher;
 		const getCommands = (): SlashCommandInfo[] => {
 			const extensionCommands: SlashCommandInfo[] = runner.getRegisteredCommands().map((command) => ({
 				name: command.invocationName,
@@ -3063,13 +3158,14 @@ export class AgentSession {
 						});
 					});
 				},
-				appendEntry: (customType, data) => {
-					const entryId = this.sessionManager.appendCustomEntry(customType, data);
+				appendEntry: (customType, data, options) => {
+					const entryId = this.sessionManager.appendCustomEntry(customType, data, options);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
 						this._emit({ type: "entry_appended", entry });
 					}
 				},
+
 				setSessionName: (name) => {
 					this.setSessionName(name);
 				},
@@ -3081,7 +3177,11 @@ export class AgentSession {
 				},
 				getActiveTools: () => this.getActiveToolNames(),
 				getAllTools: () => this.getAllTools(),
+				executeTool: (name, input, options) =>
+					toolDispatcher.execute(name, input, { ...options, signal: options?.signal ?? this.agent.signal }),
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
+				getModelVisibleTools: (activeToolNames) => this.getModelVisibleTools(activeToolNames),
+				setModelVisibleTools: (toolNames) => this.setModelVisibleTools(toolNames),
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
 				setModel: async (model) => {
@@ -3291,6 +3391,10 @@ export class AgentSession {
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
+		const previouslyActive = new Set(this.getActiveToolNames());
+		const previouslyDisabled = new Set([...this._toolRegistry.keys()].filter((name) => !previouslyActive.has(name)));
+		this.#toolDispatcher?.close();
+		this.#toolDispatcher = undefined;
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
 		oldRunner.invalidate();
 		await this.settingsManager.reload();
@@ -3302,6 +3406,8 @@ export class AgentSession {
 			flagValues: previousFlagValues,
 			includeAllExtensionTools: true,
 		});
+
+		this.setActiveToolsByName(this.getActiveToolNames().filter((name) => !previouslyDisabled.has(name)));
 
 		const hasBindings =
 			this._extensionUIContext ||

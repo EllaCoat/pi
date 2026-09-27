@@ -120,6 +120,7 @@ export type {
 	MarkdownTransformer,
 	MessageEndEvent,
 	MessageEndEventResult,
+	MessagePersistedEvent,
 	MessageRenderer,
 	MessageRenderOptions,
 	MessageStartEvent,

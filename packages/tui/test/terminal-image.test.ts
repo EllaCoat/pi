@@ -778,6 +778,17 @@ describe("imageFallback", () => {
 		}
 	});
 
+	it("normalizes only native path separators in a home filename", () => {
+		setCapabilities({ images: null, trueColor: false, hyperlinks: false });
+		try {
+			const filename = join(homedir(), "literal\\name.png");
+			const display = process.platform === "win32" ? "~/literal/name.png" : "~/literal\\name.png";
+			assert.strictEqual(imageFallback("image/png", undefined, filename), `[Image: ${display} [image/png]]`);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
 	it("wraps shortened absolute paths in OSC 8 file links when hyperlinks are enabled", () => {
 		setCapabilities({ images: null, trueColor: false, hyperlinks: true });
 		try {

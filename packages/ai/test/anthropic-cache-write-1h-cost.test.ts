@@ -122,3 +122,35 @@ describe("Anthropic 1h cache write cost", () => {
 		expect(result.usage.cost.cacheWrite).toBeCloseTo(6.25, 10);
 	});
 });
+
+describe("Anthropic cache-control payload", () => {
+	it.each(["short", "long"] as const)(
+		"sets user cache_control for %s retention without network",
+		async (cacheRetention) => {
+			let payload: unknown;
+			const result = await streamAnthropic(
+				getModel("anthropic", "claude-haiku-4-5"),
+				normalizeContext({
+					systemPrompt: "Synthetic cache payload fixture.",
+					messages: [{ role: "user", content: "cache fixture", timestamp: 1 }],
+				}),
+				{
+					apiKey: "fake-key",
+					cacheRetention,
+					onPayload(value) {
+						payload = value;
+						throw new Error("synthetic payload captured before network");
+					},
+				},
+			).result();
+			expect(result.stopReason).toBe("error");
+			const control = cacheRetention === "long" ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" };
+			expect(payload).toMatchObject({
+				messages: [
+					{ role: "user", content: expect.arrayContaining([expect.objectContaining({ cache_control: control })]) },
+				],
+				system: expect.arrayContaining([expect.objectContaining({ cache_control: control })]),
+			});
+		},
+	);
+});

@@ -99,6 +99,7 @@ import {
 	resolveModelScopeFromModels,
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
+import { OpenAICodexUsageController } from "../../core/openai-codex-usage.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
@@ -436,6 +437,9 @@ export class InteractiveMode {
 	private footer: FooterComponent;
 	private footerContainer: Container;
 	private footerDataProvider: FooterDataProvider;
+	private openAIUsageController: OpenAICodexUsageController | undefined;
+	private openAIUsageSession: AgentSession | undefined;
+	private openAIUsageTimer: NodeJS.Timeout | undefined;
 	// Stored so the same manager can be injected into custom editors, selectors, and extension UI.
 	private keybindings: KeybindingsManager;
 	private version: string;
@@ -517,6 +521,7 @@ export class InteractiveMode {
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
+	private activeExtensionDialogCancel: (() => void) | undefined;
 	private extensionTerminalInputSubscriptions = new Set<{
 		handler: (data: string) => { consume?: boolean; data?: string } | undefined;
 		unsubscribe: () => void;
@@ -2180,6 +2185,7 @@ export class InteractiveMode {
 				})();
 			},
 			getSystemPrompt: () => this.session.systemPrompt,
+			executeTool: (name, input, options) => extensionRunner.createContext().executeTool(name, input, options),
 		});
 
 		// Set up the extension shortcut handler on the default editor
@@ -2353,7 +2359,12 @@ export class InteractiveMode {
 		this.renderWidgets();
 	}
 
+	private cancelActiveExtensionDialog(): void {
+		this.activeExtensionDialogCancel?.();
+	}
+
 	private resetExtensionUI(): void {
+		this.cancelActiveExtensionDialog();
 		if (this.extensionSelector) {
 			this.hideExtensionSelector();
 		}
@@ -2596,40 +2607,90 @@ export class InteractiveMode {
 		options: string[],
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
-		return new Promise((resolve) => {
-			if (opts?.signal?.aborted) {
-				resolve(undefined);
-				return;
-			}
+		const { promise, resolve } = Promise.withResolvers<string | undefined>();
+		if (opts?.signal?.aborted) {
+			resolve(undefined);
+			return promise;
+		}
 
-			const onAbort = () => {
-				this.hideExtensionSelector();
-				resolve(undefined);
-			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
+		this.cancelActiveExtensionDialog();
 
-			this.extensionSelector = new ExtensionSelectorComponent(
-				title,
-				options,
-				(option) => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionSelector();
-					resolve(option);
-				},
-				() => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionSelector();
-					resolve(undefined);
-				},
-				{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
-			);
+		let selector: ExtensionSelectorComponent | undefined;
+		let settled = false;
+		let cancel = (): void => {};
+		const finish = (result: string | undefined): void => {
+			if (settled) return;
+			settled = true;
+			opts?.signal?.removeEventListener("abort", cancel);
+			if (this.activeExtensionDialogCancel === cancel) this.activeExtensionDialogCancel = undefined;
+			if (selector && this.extensionSelector === selector) this.hideExtensionSelector();
+			resolve(result);
+		};
+		cancel = () => finish(undefined);
+		opts?.signal?.addEventListener("abort", cancel, { once: true });
 
-			this.disposeActiveSelector();
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionSelector);
-			this.ui.setFocus(this.extensionSelector);
-			this.ui.requestRender();
-		});
+		selector = new ExtensionSelectorComponent(
+			title,
+			options,
+			(option) => finish(option),
+			() => finish(undefined),
+			{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
+		);
+		this.extensionSelector = selector;
+		this.activeExtensionDialogCancel = cancel;
+		this.disposeActiveSelector();
+		this.editorContainer.clear();
+		this.editorContainer.addChild(selector);
+		this.ui.setFocus(selector);
+		this.ui.requestRender();
+		return promise;
+	}
+
+	/**
+	 * Show a text input for extensions.
+	 */
+	private showExtensionInput(
+		title: string,
+		placeholder?: string,
+		opts?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		const { promise, resolve } = Promise.withResolvers<string | undefined>();
+		if (opts?.signal?.aborted) {
+			resolve(undefined);
+			return promise;
+		}
+
+		this.cancelActiveExtensionDialog();
+
+		let input: ExtensionInputComponent | undefined;
+		let settled = false;
+		let cancel = (): void => {};
+		const finish = (result: string | undefined): void => {
+			if (settled) return;
+			settled = true;
+			opts?.signal?.removeEventListener("abort", cancel);
+			if (this.activeExtensionDialogCancel === cancel) this.activeExtensionDialogCancel = undefined;
+			if (input && this.extensionInput === input) this.hideExtensionInput();
+			resolve(result);
+		};
+		cancel = () => finish(undefined);
+		opts?.signal?.addEventListener("abort", cancel, { once: true });
+
+		input = new ExtensionInputComponent(
+			title,
+			placeholder,
+			(value) => finish(value),
+			() => finish(undefined),
+			{ tui: this.ui, timeout: opts?.timeout },
+		);
+		this.extensionInput = input;
+		this.activeExtensionDialogCancel = cancel;
+		this.disposeActiveSelector();
+		this.editorContainer.clear();
+		this.editorContainer.addChild(input);
+		this.ui.setFocus(input);
+		this.ui.requestRender();
+		return promise;
 	}
 
 	/**
@@ -2665,50 +2726,6 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Show a text input for extensions.
-	 */
-	private showExtensionInput(
-		title: string,
-		placeholder?: string,
-		opts?: ExtensionUIDialogOptions,
-	): Promise<string | undefined> {
-		return new Promise((resolve) => {
-			if (opts?.signal?.aborted) {
-				resolve(undefined);
-				return;
-			}
-
-			const onAbort = () => {
-				this.hideExtensionInput();
-				resolve(undefined);
-			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
-
-			this.extensionInput = new ExtensionInputComponent(
-				title,
-				placeholder,
-				(value) => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionInput();
-					resolve(value);
-				},
-				() => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionInput();
-					resolve(undefined);
-				},
-				{ tui: this.ui, timeout: opts?.timeout },
-			);
-
-			this.disposeActiveSelector();
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionInput);
-			this.ui.setFocus(this.extensionInput);
-			this.ui.requestRender();
-		});
-	}
-
-	/**
 	 * Hide the extension input.
 	 */
 	private hideExtensionInput(): void {
@@ -2724,30 +2741,39 @@ export class InteractiveMode {
 	 * Show a multi-line editor for extensions (with Ctrl+G support).
 	 */
 	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
-		return new Promise((resolve) => {
-			this.extensionEditor = new ExtensionEditorComponent(
-				this.ui,
-				this.keybindings,
-				title,
-				prefill,
-				(value) => {
-					this.hideExtensionEditor();
-					resolve(value);
-				},
-				() => {
-					this.hideExtensionEditor();
-					resolve(undefined);
-				},
-				undefined,
-				this.settingsManager.getExternalEditorCommand(),
-			);
+		const { promise, resolve } = Promise.withResolvers<string | undefined>();
+		this.cancelActiveExtensionDialog();
 
-			this.disposeActiveSelector();
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionEditor);
-			this.ui.setFocus(this.extensionEditor);
-			this.ui.requestRender();
-		});
+		let editor: ExtensionEditorComponent | undefined;
+		let settled = false;
+		let cancel = (): void => {};
+		const finish = (value: string | undefined): void => {
+			if (settled) return;
+			settled = true;
+			if (this.activeExtensionDialogCancel === cancel) this.activeExtensionDialogCancel = undefined;
+			if (editor && this.extensionEditor === editor) this.hideExtensionEditor();
+			resolve(value);
+		};
+		cancel = () => finish(undefined);
+
+		editor = new ExtensionEditorComponent(
+			this.ui,
+			this.keybindings,
+			title,
+			prefill,
+			(value) => finish(value),
+			cancel,
+			undefined,
+			this.settingsManager.getExternalEditorCommand(),
+		);
+		this.extensionEditor = editor;
+		this.activeExtensionDialogCancel = cancel;
+		this.disposeActiveSelector();
+		this.editorContainer.clear();
+		this.editorContainer.addChild(editor);
+		this.ui.setFocus(editor);
+		this.ui.requestRender();
+		return promise;
 	}
 
 	/**
@@ -2766,6 +2792,8 @@ export class InteractiveMode {
 	 * Pass undefined to restore the default editor.
 	 */
 	private setCustomEditorComponent(factory: EditorFactory | undefined): void {
+		this.cancelActiveExtensionDialog();
+
 		this.editorComponentFactory = factory;
 
 		// Save text from current editor before switching
@@ -2871,6 +2899,7 @@ export class InteractiveMode {
 	): Promise<T> {
 		const savedText = this.editor.getText();
 		const isOverlay = options?.overlay ?? false;
+		if (!isOverlay) this.cancelActiveExtensionDialog();
 
 		const restoreEditor = () => {
 			this.editorContainer.clear();
@@ -4384,6 +4413,7 @@ export class InteractiveMode {
 				this.showStatus(msg);
 			} else {
 				this.footer.invalidate();
+				this.refreshOpenAIUsage();
 				this.updateEditorBorderColor();
 				const thinkingStr =
 					result.model.reasoning && result.thinkingLevel !== "off" ? ` (thinking: ${result.thinkingLevel})` : "";
@@ -4414,7 +4444,7 @@ export class InteractiveMode {
 				}
 			}
 		}
-		this.showStatus(`Tool output: ${expanded ? "expanded" : "collapsed"}`);
+		this.showStatus(`Tool input/output: ${expanded ? "expanded" : "collapsed"}`);
 	}
 
 	/** Update rendered assistant messages without rebuilding live tool components. */
@@ -4720,6 +4750,7 @@ export class InteractiveMode {
 	private showSelector(
 		create: (done: () => void) => { component: Component; focus: Component; dispose?: () => void },
 	): void {
+		this.cancelActiveExtensionDialog();
 		const token = {};
 		let dispose: (() => void) | undefined;
 		const done = () => {
@@ -5042,6 +5073,7 @@ export class InteractiveMode {
 			try {
 				await this.session.setModel(model, { persist: false });
 				this.footer.invalidate();
+				this.refreshOpenAIUsage();
 				this.updateEditorBorderColor();
 				this.showStatus(`Model: ${model.id}`);
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
@@ -5089,6 +5121,35 @@ export class InteractiveMode {
 		return findExactModelReferenceMatch(searchTerm, [...this.session.modelRuntime.getAvailableSnapshot()]);
 	}
 
+	private refreshOpenAIUsage(invalidate = false): void {
+		if (!this.isInitialized || this.isShuttingDown || /^(1|true|yes)$/i.test(process.env.PI_OFFLINE ?? "")) return;
+		const session = this.session;
+		if (!this.openAIUsageController || this.openAIUsageSession !== session) {
+			this.openAIUsageController?.dispose();
+			this.openAIUsageController = new OpenAICodexUsageController(session.modelRuntime);
+			this.openAIUsageSession = session;
+		}
+		const controller = this.openAIUsageController;
+		controller.setContext({
+			sessionId: session.sessionId,
+			providerId: session.model?.provider ?? "",
+			modelId: session.model?.id ?? "",
+		});
+		if (invalidate) controller.invalidate();
+		const pending = controller.refresh();
+		this.footer.setOpenAIUsage(controller.getSnapshot());
+		this.ui.requestRender();
+		void pending.then(() => {
+			if (this.openAIUsageController !== controller || this.session !== session || !this.isInitialized) return;
+			this.footer.setOpenAIUsage(controller.getSnapshot());
+			this.ui.requestRender();
+		});
+		if (!this.openAIUsageTimer) {
+			this.openAIUsageTimer = setInterval(() => this.refreshOpenAIUsage(), 60_000);
+			this.openAIUsageTimer.unref();
+		}
+	}
+
 	/** Update the footer's available provider count from the current snapshot without refreshing catalogs. */
 	private updateAvailableProviderCount(): void {
 		const models =
@@ -5097,6 +5158,7 @@ export class InteractiveMode {
 				: this.session.modelRuntime.getAvailableSnapshot();
 		const uniqueProviders = new Set(models.map((model) => model.provider));
 		this.footerDataProvider.setAvailableProviderCount(uniqueProviders.size);
+		this.refreshOpenAIUsage();
 	}
 
 	private async maybeWarnAboutAnthropicSubscriptionAuth(
@@ -5853,6 +5915,7 @@ export class InteractiveMode {
 						await this.session.modelRuntime.logout(providerOption.id, {
 							signal: AbortSignal.timeout(15_000),
 						});
+						this.refreshOpenAIUsage(providerOption.id === "openai-codex");
 						await this.updateAvailableProviderCount();
 						const message =
 							providerOption.authType === "oauth"
@@ -5883,6 +5946,7 @@ export class InteractiveMode {
 		authType: "oauth" | "api_key",
 		previousModel: Model<any> | undefined,
 	): Promise<void> {
+		this.refreshOpenAIUsage(providerId === "openai-codex");
 		const actionLabel = authType === "oauth" ? `Logged in to ${providerName}` : `Saved API key for ${providerName}`;
 
 		const session = this.session;
@@ -6831,6 +6895,7 @@ export class InteractiveMode {
 	}
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		this.cancelActiveExtensionDialog();
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
@@ -6838,6 +6903,11 @@ export class InteractiveMode {
 		this.clearStatusIndicator();
 		this.themeController.disableAutoSync();
 		this.clearExtensionTerminalInputListeners();
+		if (this.openAIUsageTimer) clearInterval(this.openAIUsageTimer);
+		this.openAIUsageTimer = undefined;
+		this.openAIUsageController?.dispose();
+		this.openAIUsageController = undefined;
+		this.openAIUsageSession = undefined;
 		this.footer.dispose();
 		this.footerDataProvider.dispose();
 		if (this.unsubscribe) {

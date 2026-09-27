@@ -159,6 +159,24 @@ describe("Models runtime", () => {
 		expect(long.cacheWrite).toBe(0.0000125);
 	});
 
+	it("marks calculated costs by price provenance without changing totals", () => {
+		const createUsage = (): Usage => ({
+			input: 1,
+			output: 2,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 3,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const unknownModel = testModel("custom", "unpriced");
+		unknownModel.cost.known = false;
+		const freeModel = testModel("custom", "free");
+		freeModel.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+		expect(calculateCost(unknownModel, createUsage())).toMatchObject({ total: 0, known: false });
+		expect(calculateCost(freeModel, createUsage())).toMatchObject({ total: 0, known: true });
+	});
+
 	it("registers, replaces, and deletes providers", () => {
 		const models = createModels();
 		models.setProvider(testProvider({ id: "p1" }));

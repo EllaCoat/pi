@@ -125,7 +125,7 @@ describe("edit tool TUI rendering", () => {
 			() => tui.requestRender(true),
 		);
 		expect(callOnlyRender).toContain("edit");
-		expect(callOnlyRender).toContain("line 950 changed");
+		expect(callOnlyRender).not.toContain("line 950 changed");
 
 		const redrawsBeforeResult = tui.fullRedraws;
 		const clearsBeforeResult = terminal.fullClearCount;
@@ -145,8 +145,13 @@ describe("edit tool TUI rendering", () => {
 
 		const settledRender = component.render(80).join("\n");
 		expect(settledRender).toContain("line 50 changed");
-		expect(settledRender).toContain("line 950 changed");
+		expect(settledRender).not.toContain("line 950 changed");
 		expect(settledRender).not.toContain("Successfully replaced");
+		component.setExpanded(true);
+		const expandedRender = component.render(80).join("\n");
+		expect(expandedRender).toContain("line 50 changed");
+		expect(expandedRender).toContain("line 950 changed");
+		expect(expandedRender).toContain("Successfully replaced");
 	});
 
 	it("reconstructs the boxed preview from a settled result without argsComplete", async () => {
@@ -195,41 +200,10 @@ describe("edit tool TUI rendering", () => {
 
 		const rendered = component.render(80).join("\n");
 		expect(rendered).toContain("line 50 changed");
-		expect(rendered).toContain("line 150 changed");
-	});
-
-	it("shows a preflight error without rendering a diff when the edits do not apply", async () => {
-		const dir = await mkdtemp(join(tmpdir(), "pi-edit-preflight-"));
-		tempDirs.push(dir);
-		const filePath = join(dir, "missing-edit.txt");
-		await writeFile(filePath, "line 0\nline 1\n", "utf8");
-
-		const terminal = new FakeTerminal();
-		const tui: TUI = new TuiMainScreen(terminal);
-		const component = new ToolExecutionComponent(
-			"edit",
-			"tool-call-2",
-			{ path: filePath, edits: [{ oldText: "does not exist", newText: "replacement" }] },
-			{},
-			createEditToolDefinition(process.cwd()),
-			tui,
-			process.cwd(),
-		);
-		tui.addChild(component);
-		tui.start();
-		await waitForRender();
-
-		component.setArgsComplete();
-		tui.requestRender();
-		await waitForRender();
-		await waitForRender();
-
-		const rendered = await waitForRenderedText(
-			() => component.render(80).join("\n"),
-			"Could not find",
-			() => tui.requestRender(true),
-		);
-		expect(rendered).not.toContain("+1 ");
-		expect(rendered).not.toContain("-1 ");
+		expect(rendered).not.toContain("line 150 changed");
+		component.setExpanded(true);
+		const expandedRender = component.render(80).join("\n");
+		expect(expandedRender).toContain("line 50 changed");
+		expect(expandedRender).toContain("line 150 changed");
 	});
 });

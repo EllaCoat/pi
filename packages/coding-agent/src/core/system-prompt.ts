@@ -11,8 +11,10 @@ export interface BuildSystemPromptOptions {
 	customPrompt?: string;
 	/** Exact full prompt replacement set by a before_agent_start handler. */
 	forceSystemPrompt?: string;
-	/** Tools to include in prompt. Default: [read, bash, edit, write]. */
+	/** Executable tools. Default: [read, bash, edit, write]. */
 	selectedTools?: string[];
+	/** Narrow tool descriptions without removing access to resources through a host bridge. */
+	modelVisibleTools?: readonly string[];
 	/** Optional one-line tool snippets keyed by tool name. */
 	toolSnippets?: Record<string, string>;
 	/** Guideline bullets contributed by each tool, keyed by tool name. */
@@ -21,6 +23,8 @@ export interface BuildSystemPromptOptions {
 	promptGuidelines?: string[];
 	/** Text appended from user configuration before project context, skills, and cwd. */
 	appendSystemPrompt?: string;
+	/** Additional structured sections placed directly after the base prompt. */
+	leadingSections?: Record<string, string>;
 	/** Additional XML-wrapped prompt sections keyed by tag name. */
 	sections?: Record<string, string>;
 	/** Working directory. */
@@ -37,6 +41,7 @@ export type NormalizedBuildSystemPromptOptions = BuildSystemPromptOptions & {
 	toolGuidelines: Record<string, string[]>;
 	promptGuidelines: string[];
 	appendSystemPrompt: string;
+	leadingSections: Record<string, string>;
 	sections: Record<string, string>;
 	contextFiles: Array<{ path: string; content: string }>;
 	skills: Skill[];
@@ -56,12 +61,14 @@ export function normalizeBuildSystemPromptOptions(input: BuildSystemPromptOption
 		customPrompt: input.customPrompt,
 		forceSystemPrompt: input.forceSystemPrompt,
 		selectedTools: [...(input.selectedTools ?? ["read", "bash", "edit", "write"])],
+		modelVisibleTools: input.modelVisibleTools === undefined ? undefined : [...input.modelVisibleTools],
 		toolSnippets: { ...(input.toolSnippets ?? {}) },
 		toolGuidelines: Object.fromEntries(
 			Object.entries(input.toolGuidelines ?? {}).map(([name, guidelines]) => [name, [...guidelines]]),
 		),
 		promptGuidelines: [...(input.promptGuidelines ?? [])],
 		appendSystemPrompt: input.appendSystemPrompt ?? "",
+		leadingSections: { ...(input.leadingSections ?? {}) },
 		sections: { ...(input.sections ?? {}) },
 		cwd: input.cwd,
 		contextFiles: (input.contextFiles ?? []).map((file) => ({ ...file })),
@@ -127,29 +134,41 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 		toolGuidelines,
 		promptGuidelines,
 		appendSystemPrompt,
+		leadingSections,
 		sections: customSections,
 		cwd,
 		contextFiles,
 		skills,
 	} = options;
 
-	for (const name of Object.keys(customSections)) {
+	const sectionNames = new Set<string>();
+	for (const name of [...Object.keys(leadingSections), ...Object.keys(customSections)]) {
 		if (!SYSTEM_PROMPT_SECTION_NAME.test(name) || name === "preamble") {
 			throw new Error(`Invalid system prompt section name: ${name}`);
 		}
+		if (sectionNames.has(name)) throw new Error(`Duplicate system prompt section name: ${name}`);
+		sectionNames.add(name);
 	}
 
+	const promptTools = selectedTools.filter(
+		(name) => options.modelVisibleTools === undefined || options.modelVisibleTools.includes(name),
+	);
 	const promptSections: Record<string, string> = {};
 	if (customPrompt) {
 		promptSections.preamble = customPrompt;
 	} else {
 		promptSections.preamble =
 			"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
-		const visibleTools = selectedTools.filter((name) => !!toolSnippets[name]);
+	}
+	for (const [name, content] of Object.entries(leadingSections)) {
+		if (content) promptSections[name] = content;
+	}
+	if (!customPrompt) {
+		const visibleTools = promptTools.filter((name) => !!toolSnippets[name]).sort();
 		const tools =
 			visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n") : "(none)";
 		promptSections.tools = `${tools}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.`;
-		promptSections.rules = buildRules(selectedTools, toolGuidelines, promptGuidelines);
+		promptSections.rules = buildRules(promptTools, toolGuidelines, promptGuidelines);
 		promptSections.docs = `Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):
 - Main documentation: ${getReadmePath()}
 - Additional docs: ${getDocsPath()}

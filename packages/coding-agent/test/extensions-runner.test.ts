@@ -80,6 +80,7 @@ describe("ExtensionRunner", () => {
 	};
 
 	const extensionActions: ExtensionActions = {
+		executeTool: async () => ({ content: [], details: undefined, isError: true, toolCallId: "unavailable" }),
 		sendMessage: () => {},
 		sendUserMessage: () => {},
 		appendEntry: () => {},

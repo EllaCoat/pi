@@ -1,7 +1,9 @@
+import type { PathLike } from "node:fs";
 import { applyPatch } from "diff";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import type * as FsPromises from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { basename, join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeBashWithOperations } from "../src/core/bash-executor.ts";
 import type { ExtensionContext } from "../src/core/extensions/types.ts";
@@ -27,6 +29,21 @@ import {
 	createWriteTool,
 } from "../src/index.ts";
 import * as shellModule from "../src/utils/shell.ts";
+
+const filesystemMocks = vi.hoisted(() => ({ accessDeniedPath: undefined as string | undefined }));
+
+vi.mock("fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof FsPromises>();
+	return {
+		...actual,
+		access: async (path: PathLike, mode?: number) => {
+			if (String(path) === filesystemMocks.accessDeniedPath) {
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return actual.access(path, mode);
+		},
+	};
+});
 
 const readTool = createReadTool(process.cwd());
 const writeTool = createWriteTool(process.cwd());
@@ -435,14 +452,24 @@ describe("Coding Agent Tools", () => {
 		it("should include EACCES for read-only files", async () => {
 			const testFile = join(testDir, "edit-readonly.txt");
 			writeFileSync(testFile, "hello\n");
-			chmodSync(testFile, 0o444);
+			const writeFile = vi.fn(async () => {});
+			const readOnlyTool = createEditTool(testDir, {
+				operations: {
+					access: async () => {
+						throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+					},
+					readFile: async () => Buffer.from("hello\n", "utf-8"),
+					writeFile,
+				},
+			});
 
 			await expect(
-				editTool.execute("test-call-14", {
+				readOnlyTool.execute("test-call-14", {
 					path: testFile,
 					edits: [{ oldText: "hello", newText: "world" }],
 				}),
 			).rejects.toThrow(`Could not edit file: ${testFile}. Error code: EACCES.`);
+			expect(writeFile).not.toHaveBeenCalled();
 		});
 
 		it("should include the original error message for unknown edit access errors", async () => {
@@ -474,11 +501,13 @@ describe("Coding Agent Tools", () => {
 		it("should include EACCES in diff preview for unreadable files", async () => {
 			const unreadableFile = join(testDir, "unreadable-preview.txt");
 			writeFileSync(unreadableFile, "hello\n");
-			chmodSync(unreadableFile, 0o222);
-
-			const result = await computeEditsDiff(unreadableFile, [{ oldText: "hello", newText: "world" }], testDir);
-
-			expect(result).toEqual({ error: `Could not edit file: ${unreadableFile}. Error code: EACCES.` });
+			filesystemMocks.accessDeniedPath = unreadableFile;
+			try {
+				const result = await computeEditsDiff(unreadableFile, [{ oldText: "hello", newText: "world" }], testDir);
+				expect(result).toEqual({ error: `Could not edit file: ${unreadableFile}. Error code: EACCES.` });
+			} finally {
+				filesystemMocks.accessDeniedPath = undefined;
+			}
 		});
 	});
 
@@ -870,6 +899,7 @@ describe("Coding Agent Tools", () => {
 
 			const result = await grepTool.execute("test-call-grep-injection", {
 				pattern: `--pre=${payload}`,
+				literal: true,
 				path: testDir,
 			});
 
@@ -1053,7 +1083,7 @@ describe("tool cwd resolution", () => {
 			fakeCtx(testDir),
 		);
 		const output = getTextOutput(result);
-		expect(output).toContain(testDir);
+		expect(output.trim().split(/[\\/]/).at(-1)).toBe(basename(testDir));
 	});
 });
 

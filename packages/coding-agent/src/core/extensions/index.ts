@@ -113,6 +113,7 @@ export type {
 	// Events - Message
 	MessageEndEvent,
 	MessageEndEventResult,
+	MessagePersistedEvent,
 	MessageRenderer,
 	MessageRenderOptions,
 	MessageStartEvent,

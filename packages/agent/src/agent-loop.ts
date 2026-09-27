@@ -106,7 +106,7 @@ export async function runAgentLoop(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): Promise<AgentMessage[]> {
-	const initialMessages = declareToolChanges(context, prompts);
+	const initialMessages = declareToolChanges(context, prompts, config.getModelVisibleTools?.());
 	const newMessages: AgentMessage[] = [...initialMessages];
 	const currentContext: AgentContext = {
 		...context,
@@ -207,7 +207,11 @@ async function runLoop(
 			}
 
 			// Process prepared and queued messages before the next assistant response.
-			for (const message of declareToolChanges(currentContext, [...preparedMessages, ...pendingMessages])) {
+			for (const message of declareToolChanges(
+				currentContext,
+				[...preparedMessages, ...pendingMessages],
+				config.getModelVisibleTools?.(),
+			)) {
 				await emit({ type: "message_start", message });
 				await emit({ type: "message_end", message });
 				currentContext.messages.push(message);
@@ -320,16 +324,24 @@ async function runLoop(
 }
 
 /**
- * Declare tool loadout changes to the model.
- *
  * `context.tools` is what the runtime can execute; the transcript's system messages declare
  * what the model may call. Before each request the difference becomes `toolsAdded` and
- * `toolsRemoved` on a system message. When a pending system message exists, its tool fields
- * are treated as intent and replaced with the delta between the committed transcript and
- * the executable set, so replay always yields exactly `context.tools`. Otherwise a new
- * system message is inserted before the first non-system pending message.
+ * `toolsRemoved` on a system message. The optional model-visible set narrows only those
+ * declarations; execution continues to use `context.tools`. When a pending system message
+ * exists, its tool fields are replaced with the delta from the committed transcript to the
+ * model-visible executable set. Otherwise a new system message is inserted before the first
+ * non-system pending message.
  */
-function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage[]): AgentMessage[] {
+function declareToolChanges(
+	context: AgentContext,
+	pendingMessages: AgentMessage[],
+	modelVisibleToolNames?: readonly string[],
+): AgentMessage[] {
+	const modelVisibleTools = modelVisibleToolNames === undefined ? undefined : new Set(modelVisibleToolNames);
+	const declaredTools = (context.tools ?? [])
+		.filter((tool) => modelVisibleTools === undefined || modelVisibleTools.has(tool.name))
+		.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
+		.map(toToolDeclaration);
 	let systemIndex = -1;
 	for (let i = pendingMessages.length - 1; i >= 0; i--) {
 		if (pendingMessages[i].role === "system") {
@@ -343,10 +355,7 @@ function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage
 				index === systemIndex ? withToolChanges(pending, NO_CHANGES) : message,
 			)
 		: pendingMessages;
-	const changes = getToolStateChanges(
-		getCurrentTools([...context.messages, ...baseline]),
-		(context.tools ?? []).map(toToolDeclaration),
-	);
+	const changes = getToolStateChanges(getCurrentTools([...context.messages, ...baseline]), declaredTools);
 	const unchanged = changes.toolsAdded.length === 0 && changes.toolsRemoved.length === 0;
 
 	if (pending) {

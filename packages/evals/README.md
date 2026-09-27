@@ -19,53 +19,40 @@ Runner code lives in `src/`:
 
 Eval suites and their fixtures live under `evals/`. Image build files live in `docker/`.
 
-## Run evals
+## Run user-authored evals
 
-Host evals (smoke, documentation audit) and documentation-lift evals need `PI_PROVIDER` and `PI_MODEL`.
+This workspace keeps the general evaluation runner but ships no built-in evaluation scenarios. Add a `*.eval.ts` host case or `*.docs.eval.ts` documentation case under `evals/`, then select it explicitly. There is no default combined `eval` command, and an empty case set is an error.
 
-```bash
-PI_PROVIDER=openai-codex PI_MODEL=gpt-5.6-sol npm run eval -w packages/evals
-```
-
-That runs host evals, then the documentation comparison. Extra CLI flags after `--` go to `eval:docs` only.
-
-Host only:
-
-```bash
-PI_PROVIDER=openai-codex PI_MODEL=gpt-5.6-sol npm run eval:host -w packages/evals
-```
-
-One host suite:
+Host case:
 
 ```bash
 PI_PROVIDER=openai-codex PI_MODEL=gpt-5.6-sol \
-  npm run eval:host -w packages/evals -- evals/documentation-audit.eval.ts
+  npm run eval:host -w packages/evals -- evals/<your-host-case>.eval.ts
 ```
 
-## Run documentation comparisons
-
-From the repository root:
+Documentation comparison:
 
 ```bash
 npm run eval:docs -w packages/evals -- \
+  evals/<your-docs-case>.docs.eval.ts \
   --provider openai-codex \
   --model gpt-5.6-sol
 ```
 
-`PI_PROVIDER` and `PI_MODEL` provide the same defaults. Both values are required.
-
-The default is one run per variant. Increase repetitions explicitly when measuring stability:
+The documentation runner defaults to one run per variant. Increase repetitions explicitly when measuring stability:
 
 ```bash
 npm run eval:docs -w packages/evals -- \
-  evals/extensions.docs.eval.ts \
+  evals/<your-docs-case>.docs.eval.ts \
   --runs-per-variant 5
 ```
 
 `PI_EVAL_RUNS_PER_VARIANT=5` is equivalent. Vitest filters are applied during discovery:
 
 ```bash
-npm run eval:docs -w packages/evals -- -t "adds the model"
+npm run eval:docs -w packages/evals -- \
+  evals/<your-docs-case>.docs.eval.ts \
+  -t "completes the task"
 ```
 
 The runner:

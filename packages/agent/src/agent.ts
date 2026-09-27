@@ -35,6 +35,11 @@ import type {
 
 export type { QueueMode } from "./types.ts";
 
+export type ModelVisibleToolSelection =
+	| readonly string[]
+	| ((activeToolNames: readonly string[]) => readonly string[] | undefined)
+	| undefined;
+
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.filter(
 		(message) =>
@@ -187,6 +192,7 @@ type ActiveRun = {
  */
 export class Agent {
 	private _state: MutableAgentState;
+	#modelVisibleTools: ModelVisibleToolSelection;
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 	private readonly steeringQueue: PendingMessageQueue;
 	private readonly followUpQueue: PendingMessageQueue;
@@ -275,6 +281,23 @@ export class Agent {
 	 */
 	get state(): AgentState {
 		return this._state;
+	}
+
+	/** Names of executable tools currently declared to the model, or undefined for all active tools. */
+	getModelVisibleTools(
+		activeToolNames: readonly string[] = this.state.tools.map((tool) => tool.name),
+	): string[] | undefined {
+		const selected =
+			typeof this.#modelVisibleTools === "function"
+				? this.#modelVisibleTools(activeToolNames)
+				: this.#modelVisibleTools;
+		return selected === undefined ? undefined : [...new Set(selected)];
+	}
+
+	/** Limit model declarations without changing the tools the runtime can execute. */
+	setModelVisibleTools(selection: ModelVisibleToolSelection): void {
+		this.#modelVisibleTools =
+			typeof selection === "function" || selection === undefined ? selection : [...new Set(selection)];
 	}
 
 	/** Controls how queued steering messages are drained. */
@@ -477,6 +500,7 @@ export class Agent {
 			thinkingBudgets: this.thinkingBudgets,
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
+			getModelVisibleTools: () => this.getModelVisibleTools(),
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			finishTurn: this.finishTurn,

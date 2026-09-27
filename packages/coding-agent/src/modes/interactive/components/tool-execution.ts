@@ -33,12 +33,16 @@ export interface ToolRenderers {
 }
 
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
+import { BashResultRenderComponent } from "../../../core/tools/renderers/bash.ts";
 import { convertToPng } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
-import { keyHint } from "./keybinding-hints.ts";
+import { formatToolInput, ToolContentPreview } from "./input-preview.ts";
 
-const FALLBACK_PREVIEW_LINES = 10;
-
+type ToolResultDisplay = {
+	content: AgentToolResult["content"];
+	isError: boolean;
+	details?: unknown;
+};
 export interface ToolExecutionOptions {
 	showImages?: boolean;
 	imageWidthCells?: number;
@@ -46,8 +50,6 @@ export interface ToolExecutionOptions {
 
 export class ToolExecutionComponent extends Container {
 	private contentBox: Box;
-	private contentText: Text;
-	private contentTextRegion: MouseRegion;
 	private selfRenderContainer: Container;
 	private selfRenderHeight = 0;
 	private callRendererComponent?: Component;
@@ -67,11 +69,7 @@ export class ToolExecutionComponent extends Container {
 	private cwd: string;
 	private executionStarted = false;
 	private argsComplete = false;
-	private result?: {
-		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
-		isError: boolean;
-		details?: any;
-	};
+	private result?: ToolResultDisplay;
 	private convertedImages: Map<
 		number,
 		{ sourceData: string; sourceMimeType: string; data: string; mimeType: string }
@@ -99,19 +97,10 @@ export class ToolExecutionComponent extends Container {
 
 		this.addChild(new Spacer(1));
 
-		// Always create all shell variants. contentBox is used for default renderer-based composition.
-		// selfRenderContainer is used when the tool renders its own framing.
-		// contentText is reserved for generic fallback rendering when no tool definition exists.
+		// Compose every tool through the same call/result containers; custom renderers only supply presentation.
 		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
-		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
-		this.contentTextRegion = this.createResultRegion(this.contentText);
 		this.selfRenderContainer = new Container();
-
-		if (this.hasRendererDefinition()) {
-			this.addChild(this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox);
-		} else {
-			this.addChild(this.contentTextRegion);
-		}
+		this.addChild(this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox);
 
 		this.updateDisplay();
 	}
@@ -152,24 +141,16 @@ export class ToolExecutionComponent extends Container {
 		};
 	}
 
-	private createCallFallback(): Component {
-		return new Text(theme.fg("toolTitle", theme.bold(this.toolName)), 0, 0);
+	private createCallFallback(title = this.toolName): Component {
+		const content = formatToolInput(this.args);
+		const label = theme.fg("toolTitle", theme.bold(title));
+		return new Text(content ? `${label}\n\n${content}` : label, 0, 0);
 	}
 
 	private createResultFallback(): Component | undefined {
 		const output = this.getTextOutput();
-		if (!output) {
-			return undefined;
-		}
-
-		const lines = output.split("\n");
-		const displayLines = this.expanded ? lines : lines.slice(0, FALLBACK_PREVIEW_LINES);
-		const remaining = lines.length - displayLines.length;
-		let text = displayLines.map((line) => theme.fg("toolOutput", line)).join("\n");
-		if (remaining > 0) {
-			text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
-		}
-		return new Text(text, 0, 0);
+		if (!output) return undefined;
+		return new ToolContentPreview(new Text(theme.fg("toolOutput", output), 0, 0), this.expanded, "output");
 	}
 
 	private createResultRegion(component: Component): MouseRegion {
@@ -197,14 +178,7 @@ export class ToolExecutionComponent extends Container {
 		this.ui.requestRender();
 	}
 
-	updateResult(
-		result: {
-			content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
-			details?: any;
-			isError: boolean;
-		},
-		isPartial = false,
-	): void {
+	updateResult(result: ToolResultDisplay, isPartial = false): void {
 		this.result = result;
 		this.isPartial = isPartial;
 		this.updateDisplay();
@@ -313,63 +287,67 @@ export class ToolExecutionComponent extends Container {
 
 		let hasContent = false;
 		this.hideComponent = false;
-		if (this.hasRendererDefinition()) {
-			const renderContainer = this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox;
-			if (renderContainer instanceof Box) {
-				renderContainer.setBgFn(bgFn);
-			}
-			renderContainer.clear();
+		const renderContainer = this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox;
+		if (renderContainer instanceof Box) {
+			renderContainer.setBgFn(bgFn);
+		}
+		renderContainer.clear();
 
-			const callRenderer = this.getCallRenderer();
-			if (!callRenderer) {
-				renderContainer.addChild(this.createResultRegion(this.createCallFallback()));
-				hasContent = true;
-			} else {
-				try {
-					const component = callRenderer(this.args, theme, this.getRenderContext(this.callRendererComponent));
-					this.callRendererComponent = component;
+		const callRenderer = this.getCallRenderer();
+		let callComponent: Component;
+		if (callRenderer) {
+			try {
+				callComponent = callRenderer(this.args, theme, this.getRenderContext(this.callRendererComponent));
+				this.callRendererComponent = callComponent;
+			} catch {
+				this.callRendererComponent = undefined;
+				callComponent = this.createCallFallback();
+			}
+		} else {
+			this.callRendererComponent = undefined;
+			callComponent = this.createCallFallback();
+		}
+		renderContainer.addChild(this.createResultRegion(new ToolContentPreview(callComponent, this.expanded)));
+		if (this.expanded && callRenderer && formatToolInput(this.args)) {
+			renderContainer.addChild(this.createResultRegion(this.createCallFallback("Input arguments")));
+		}
+		hasContent = true;
+
+		if (this.result) {
+			const resultRenderer = this.getResultRenderer();
+			if (!resultRenderer) {
+				const component = this.createResultFallback();
+				if (component) {
 					renderContainer.addChild(this.createResultRegion(component));
 					hasContent = true;
-				} catch {
-					this.callRendererComponent = undefined;
-					renderContainer.addChild(this.createResultRegion(this.createCallFallback()));
-					hasContent = true;
 				}
-			}
-
-			if (this.result) {
-				const resultRenderer = this.getResultRenderer();
-				if (!resultRenderer) {
+			} else {
+				try {
+					const component = resultRenderer(
+						{ content: this.result.content, details: this.result.details },
+						{ expanded: this.expanded, isPartial: this.isPartial },
+						theme,
+						this.getRenderContext(this.resultRendererComponent),
+					);
+					this.resultRendererComponent = component;
+					// Shell results already use a visual-line budget and format the full-output link once.
+					let display: Component = component;
+					if (!(component instanceof BashResultRenderComponent)) {
+						display = this.expanded
+							? (this.createResultFallback() ?? component)
+							: new ToolContentPreview(component, false, "rendered-output");
+					}
+					renderContainer.addChild(this.createResultRegion(display));
+					hasContent = true;
+				} catch {
+					this.resultRendererComponent = undefined;
 					const component = this.createResultFallback();
 					if (component) {
 						renderContainer.addChild(this.createResultRegion(component));
 						hasContent = true;
 					}
-				} else {
-					try {
-						const component = resultRenderer(
-							{ content: this.result.content as any, details: this.result.details },
-							{ expanded: this.expanded, isPartial: this.isPartial },
-							theme,
-							this.getRenderContext(this.resultRendererComponent),
-						);
-						this.resultRendererComponent = component;
-						renderContainer.addChild(this.createResultRegion(component));
-						hasContent = true;
-					} catch {
-						this.resultRendererComponent = undefined;
-						const component = this.createResultFallback();
-						if (component) {
-							renderContainer.addChild(this.createResultRegion(component));
-							hasContent = true;
-						}
-					}
 				}
 			}
-		} else {
-			this.contentText.setCustomBgFn(bgFn);
-			this.contentText.setText(this.formatToolExecution());
-			hasContent = true;
 		}
 
 		for (const img of this.imageComponents) {
@@ -416,18 +394,5 @@ export class ToolExecutionComponent extends Container {
 
 	private getTextOutput(): string {
 		return getRenderedTextOutput(this.result, this.showImages);
-	}
-
-	private formatToolExecution(): string {
-		let text = theme.fg("toolTitle", theme.bold(this.toolName));
-		const content = JSON.stringify(this.args, null, 2);
-		if (content) {
-			text += `\n\n${content}`;
-		}
-		const output = this.getTextOutput();
-		if (output) {
-			text += `\n${output}`;
-		}
-		return text;
 	}
 }

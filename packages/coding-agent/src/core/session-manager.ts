@@ -129,6 +129,8 @@ export interface CustomEntry<T = unknown> extends SessionEntryBase {
 	type: "custom";
 	customType: string;
 	data?: T;
+	/** Active leaf to restore when this entry is persisted on another branch. */
+	resumeLeafId?: string | null;
 }
 
 /** Label entry for user-defined bookmarks/markers on entries. */
@@ -1107,8 +1109,15 @@ export class SessionManager {
 		this.leafId = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
+			const parentExists = entry.parentId === null || this.byId.has(entry.parentId);
+			const resumeLeafId = entry.type === "custom" ? entry.resumeLeafId : undefined;
+			const resumeLeafExists =
+				resumeLeafId === null || (typeof resumeLeafId === "string" && this.byId.has(resumeLeafId));
 			this.byId.set(entry.id, entry);
-			this.leafId = entry.id;
+			this.leafId =
+				entry.type === "custom" && resumeLeafId !== undefined && parentExists && resumeLeafExists
+					? resumeLeafId
+					: entry.id;
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -1157,21 +1166,23 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	/**
+	 * A new session file is created only once the session contains a user or assistant message.
+	 * Setup entries alone (model, thinking level, system prompt) stay in memory so opening and
+	 * closing pi without chatting leaves no file behind. Starting at the user message (not the
+	 * first assistant reply) keeps the prompt on disk if the first turn never completes (#10000).
+	 */
+	private _hasConversation(): boolean {
+		return this.fileEntries.some(
+			(e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"),
+		);
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		if (!hasAssistant) {
-			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
-			} else {
-				// Mark as not flushed so when assistant arrives, all entries get written
-				this.flushed = false;
-			}
-			return;
-		}
-
 		if (!this.flushed) {
+			if (!this._hasConversation()) return;
 			const fd = openSync(this.sessionFile, "wx");
 			try {
 				for (const e of this.fileEntries) {
@@ -1186,10 +1197,10 @@ export class SessionManager {
 		}
 	}
 
-	private _appendEntry(entry: SessionEntry): void {
+	private _appendEntry(entry: SessionEntry, advanceLeaf = true): void {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
-		this.leafId = entry.id;
+		if (advanceLeaf) this.leafId = entry.id;
 		this._persist(entry);
 	}
 
@@ -1284,17 +1295,27 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
-	appendCustomEntry(customType: string, data?: unknown): string {
+	/**
+	 * Append a custom entry for extension state. An explicit parent keeps the active leaf unchanged and
+	 * records the leaf to resume from when the session file is reopened.
+	 */
+	appendCustomEntry(customType: string, data?: unknown, options?: { parentId: string | null }): string {
+		const detached = options !== undefined;
+		const parentId = detached ? options.parentId : this.leafId;
+		if (parentId !== null && !this.byId.has(parentId)) throw new Error(`Entry ${parentId} not found`);
+		const resumeLeafId = this.leafId;
+		if (detached && resumeLeafId !== null && !this.byId.has(resumeLeafId))
+			throw new Error(`Entry ${resumeLeafId} not found`);
 		const entry: CustomEntry = {
 			type: "custom",
 			customType,
 			data,
 			id: generateId(this.byId),
-			parentId: this.leafId,
+			parentId,
 			timestamp: new Date().toISOString(),
+			...(detached ? { resumeLeafId } : {}),
 		};
-		this._appendEntry(entry);
+		this._appendEntry(entry, !detached);
 		return entry.id;
 	}
 
@@ -1707,13 +1728,9 @@ export class SessionManager {
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
 
-			// Only write the file now if it contains an assistant message.
-			// Otherwise defer to _persist(), which creates the file on the
-			// first assistant response, matching the newSession() contract
-			// and avoiding the duplicate-header bug when _persist()'s
-			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-			if (hasAssistant) {
+			// Use the same rule as _persist(): write now if the branched path already
+			// has a conversation, otherwise let _persist() create the file later.
+			if (this._hasConversation()) {
 				this._rewriteFile();
 				this.flushed = true;
 			} else {
