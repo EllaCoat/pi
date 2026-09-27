@@ -79,6 +79,133 @@ describe("personal harness extension in an AgentSession", () => {
 		for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
 	});
 
+	it("caps both child notifications at 10000 characters while explicit retrieval keeps full text", async () => {
+		const intermediate = "ordinary child update ".repeat(600);
+		const finalText = "ordinary final result ".repeat(600);
+		const harness = await create(
+			dataDirectory(),
+			{},
+			{
+				createSubagentSession: async (_request, signal, callbacks) => ({
+					prompt: async () => {
+						await callbacks.onMessage(intermediate, false, signal);
+					},
+					send: async () => {},
+					abort: async () => {},
+					dispose: async () => {},
+					getLastAssistantText: () => finalText,
+					subscribe: () => () => {},
+				}),
+			},
+		);
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("task", {
+						action: "spawn",
+						task: "Long report fixture",
+						provider: "fixture",
+						model: "fixture",
+						thinking: "off",
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("Started."),
+		]);
+		await harness.session.prompt("Run the artificial long report");
+		const id = JSON.parse(resultText(harness, "task")[0]).id;
+		await vi.waitFor(() =>
+			expect(
+				harness.session.messages.filter(
+					(m) =>
+						m.role === "custom" &&
+						["personal-harness-child-message", "personal-harness-child-result"].includes(m.customType),
+				),
+			).toHaveLength(2),
+		);
+		const notices = harness.session.messages.filter(
+			(m) =>
+				m.role === "custom" &&
+				["personal-harness-child-message", "personal-harness-child-result"].includes(m.customType),
+		);
+		for (const notice of notices) expect(getMessageText(notice).length).toBeLessThanOrEqual(10000);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("task", { action: "wait", id })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("task", { action: "result", id })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Read both full messages."),
+		]);
+		await harness.session.prompt("Read the complete stored texts");
+		const results = resultText(harness, "task");
+		expect(JSON.parse(results.at(-2)!)).toMatchObject({ type: "message", message: { id, text: intermediate } });
+		expect(JSON.parse(results.at(-1)!)).toMatchObject({ id, text: finalText });
+	});
+
+	it("routes intermediate child messages and replies through the task tool", async () => {
+		let childText = "";
+		const requestSeen: unknown[] = [];
+		const harness = await create(
+			dataDirectory(),
+			{},
+			{
+				createSubagentSession: async (request, signal, callbacks) => {
+					requestSeen.push(request);
+					return {
+						prompt: async () => {
+							childText = (await callbacks.onMessage("Please choose fixture A or B.", true, signal)) ?? "";
+						},
+						send: async () => {
+							throw new Error("A waiting child reply must not steer another model turn");
+						},
+						abort: async () => {},
+						dispose: async () => {},
+						getLastAssistantText: () => childText,
+						subscribe: () => () => {},
+					};
+				},
+			},
+		);
+		let id = "";
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("task", {
+						action: "spawn",
+						task: "Inspect fixture",
+						context: "Only artificial inputs",
+						provider: "fixture",
+						model: "fixture",
+						thinking: "off",
+						allowedTools: ["echo"],
+						mcp: [],
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			() => {
+				id = JSON.parse(resultText(harness, "task").at(-1)!).id;
+				return fauxAssistantMessage([fauxToolCall("task", { action: "wait", id })], { stopReason: "toolUse" });
+			},
+			() => {
+				expect(JSON.parse(resultText(harness, "task").at(-1)!)).toMatchObject({
+					type: "message",
+					message: { id, text: "Please choose fixture A or B." },
+				});
+				return fauxAssistantMessage([fauxToolCall("task", { action: "send", id, message: "Choose A." })], {
+					stopReason: "toolUse",
+				});
+			},
+			() => fauxAssistantMessage([fauxToolCall("task", { action: "wait", id })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("Child replied."),
+		]);
+		await harness.session.prompt("Run the child and answer its question");
+		expect(JSON.parse(resultText(harness, "task").at(-1)!)).toMatchObject({
+			type: "result",
+			result: { status: "completed", text: "Choose A." },
+		});
+		expect(requestSeen[0]).toMatchObject({ context: "Only artificial inputs", allowedTools: ["echo"], mcp: [] });
+	});
+
 	it("runs persistent JavaScript with host hooks, shows partial failure, and blocks recursive eval", async () => {
 		const seen: string[] = [];
 		const harness = await create(dataDirectory(), {
@@ -353,6 +480,7 @@ describe("personal harness extension in an AgentSession", () => {
 				createSubagentSession: async () => ({
 					prompt: async () => childGate.promise,
 					abort: async () => childGate.resolve(),
+					send: async () => {},
 					dispose: async () => {},
 					getLastAssistantText: () => "child fixture finished",
 					subscribe: () => () => {},

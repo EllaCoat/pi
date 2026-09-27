@@ -6,7 +6,7 @@ import {
 	type ImageContent,
 	type TextContent,
 } from "@earendil-works/pi-ai";
-import { type Static, Type } from "typebox";
+import { type Static, type TSchema, Type } from "typebox";
 import type { AgentSession } from "../core/agent-session.ts";
 import type {
 	ExtensionAPI,
@@ -23,13 +23,18 @@ import { CodeModeSessionManager } from "./code-mode/index.ts";
 import type { HarnessHookOptions } from "./hooks/index.ts";
 import { installHooks } from "./hooks/index.ts";
 import { isRecord } from "./hooks/jev-types.ts";
-import type { HarnessChildSession, HarnessSubagentRequest } from "./subagents.ts";
+import type { HarnessChildSession, HarnessSubagentCallbacks, HarnessSubagentRequest } from "./subagents.ts";
 import { installCodeModeToolSurface } from "./tool-surface.ts";
 
 const CHILD_EVAL_TOOL = "eval";
+const CHILD_MESSAGE_TOOL = "message_parent";
 const CHILD_EVAL_PARAMETERS = Type.Object({
 	language: Type.Union([Type.Literal("javascript"), Type.Literal("python")]),
 	code: Type.String({ minLength: 1 }),
+});
+const CHILD_MESSAGE_PARAMETERS = Type.Object({
+	text: Type.String({ minLength: 1 }),
+	waitForReply: Type.Optional(Type.Boolean()),
 });
 const CHILD_ONLY_TOOLS: Record<string, true> = {
 	goal: true,
@@ -41,12 +46,16 @@ const CHILD_ONLY_TOOLS: Record<string, true> = {
 	usage: true,
 	tool_info: true,
 };
+const SKILL_TOOLS: Record<string, true> = {
+	skill_read: true,
+	skill_index: true,
+};
 
 export interface PiSubagentSessionFactoryOptions {
 	readonly api: ExtensionAPI;
 	readonly context: ExtensionContext;
 	readonly dataDir: string;
-	readonly inheritedSkillPaths?: readonly string[];
+	readonly systemPrompt?: string;
 	readonly hookValues?: Omit<Partial<HarnessHookOptions>, "evaluate" | "hold" | "ledger">;
 	readonly evaluate: HarnessHookOptions["evaluate"];
 	readonly ledger: HarnessHookOptions["ledger"];
@@ -113,7 +122,7 @@ function codeTool(sessionId: string, codeMode: CodeModeSessionManager, cwd: stri
 		name: CHILD_EVAL_TOOL,
 		label: "personal eval",
 		description:
-			"Run persistent JavaScript or Python and call active parent host tools through tool.<name>(args). Use await tool.tool_info({}) to discover permitted host tools and tool.tool_info({name: 'NAME'}) for a schema.",
+			"Run persistent JavaScript or Python. Use tool.<name>(args) only for this child's selected host tools; use tool.message_parent({text, waitForReply?}) to report a finding or ask the parent, and tool.tool_info({}) to inspect permitted host tools.",
 		promptSnippet: "Run persistent code with the isolated child kernel and approved host tools.",
 		parameters: CHILD_EVAL_PARAMETERS,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
@@ -153,6 +162,36 @@ function codeTool(sessionId: string, codeMode: CodeModeSessionManager, cwd: stri
 	};
 }
 
+function parentMessageTool(
+	callbacks: HarnessSubagentCallbacks,
+	signal: AbortSignal,
+	pauseTimeout: () => () => void,
+): ToolDefinition {
+	return {
+		name: CHILD_MESSAGE_TOOL,
+		label: "message parent",
+		description: "Report a finding or ask the parent a question; optionally wait for its reply.",
+		parameters: CHILD_MESSAGE_PARAMETERS,
+		execute: async (_toolCallId, params, toolSignal) => {
+			const input = params as Static<typeof CHILD_MESSAGE_PARAMETERS>;
+			const effectiveSignal = toolSignal ? AbortSignal.any([signal, toolSignal]) : signal;
+			effectiveSignal.throwIfAborted();
+			const release = input.waitForReply ? pauseTimeout() : () => {};
+			try {
+				const reply = await callbacks.onMessage(input.text, input.waitForReply === true, effectiveSignal);
+				return {
+					content: [
+						{ type: "text", text: reply === undefined ? "Message sent to parent." : `Parent replied: ${reply}` },
+					],
+					details: { waitingForReply: input.waitForReply === true },
+				};
+			} finally {
+				release();
+			}
+		},
+	};
+}
+
 function childHooksFactory(options: PiSubagentSessionFactoryOptions): ExtensionFactory {
 	return (api) => {
 		installCodeModeToolSurface(api);
@@ -171,8 +210,12 @@ function childHooksFactory(options: PiSubagentSessionFactoryOptions): ExtensionF
 
 export function createPiSubagentSessionFactory(
 	options: PiSubagentSessionFactoryOptions,
-): (request: HarnessSubagentRequest, signal: AbortSignal) => Promise<HarnessChildSession> {
-	return async (request, signal) => {
+): (
+	request: HarnessSubagentRequest,
+	signal: AbortSignal,
+	callbacks: HarnessSubagentCallbacks,
+) => Promise<HarnessChildSession> {
+	return async (request, signal, callbacks) => {
 		signal.throwIfAborted();
 		const { context, api } = options;
 		const model = context.modelRegistry.find(request.provider, request.model);
@@ -190,8 +233,37 @@ export function createPiSubagentSessionFactory(
 			{ cacheWarming: "off" },
 			{ projectTrusted: context.isProjectTrusted() },
 		);
-		const hostToolNames = new Set(api.getActiveTools().filter((name) => !Object.hasOwn(CHILD_ONLY_TOOLS, name)));
-		const available = api.getAllTools().filter((tool) => hostToolNames.has(tool.name));
+		const parentActiveToolNames = new Set(api.getActiveTools());
+		const parentTools = new Map(
+			api
+				.getAllTools()
+				.filter((tool) => parentActiveToolNames.has(tool.name))
+				.map((tool) => [tool.name, tool] as const),
+		);
+		const requestedToolNames =
+			request.allowedTools ??
+			[...parentActiveToolNames].filter(
+				(name) => !Object.hasOwn(CHILD_ONLY_TOOLS, name) && !Object.hasOwn(SKILL_TOOLS, name),
+			);
+		const hostToolNames = new Set<string>();
+		for (const name of requestedToolNames) {
+			if (!parentActiveToolNames.has(name) || !parentTools.has(name))
+				throw new Error(`Requested child tool is unavailable: ${name}`);
+			if (Object.hasOwn(CHILD_ONLY_TOOLS, name)) {
+				if (name === CHILD_EVAL_TOOL || name === "tool_info") continue;
+				throw new Error(`Tool ${name} cannot be delegated to child sessions`);
+			}
+			if (request.allowedTools === undefined && Object.hasOwn(SKILL_TOOLS, name)) continue;
+			hostToolNames.add(name);
+		}
+		if (request.mcp?.length && !hostToolNames.has("mcp"))
+			throw new Error("MCP access requires the mcp tool to be selected for this child");
+		for (const access of request.mcp ?? []) {
+			if (!access.server.trim() || access.names.some((name) => !name.trim()))
+				throw new Error("MCP access requires a server and non-empty tool names");
+		}
+		if (request.mcp?.length === 0) hostToolNames.delete("mcp");
+		const available = [...parentTools.values()].filter((tool) => hostToolNames.has(tool.name));
 		let childSession: AgentSession | undefined;
 		let childAssistantMessage: AssistantMessage | undefined;
 		const currentExecution = (): { context: AgentContext; assistantMessage: AssistantMessage } => {
@@ -206,59 +278,121 @@ export function createPiSubagentSessionFactory(
 				assistantMessage,
 			};
 		};
+		const assertMcpAccess = (args: unknown): void => {
+			if (request.mcp === undefined) return;
+			if (!isRecord(args) || typeof args.server !== "string")
+				throw new Error("MCP access requires a selected server and tool name");
+			const serverAccess = request.mcp.filter((access) => access.server === args.server);
+			if (serverAccess.length === 0) throw new Error(`MCP server is not allowed for this child: ${args.server}`);
+			if (args.action === "discover") return;
+			if (
+				args.action === "call" &&
+				typeof args.name === "string" &&
+				serverAccess.some((access) => access.names.includes(args.name as string))
+			)
+				return;
+			throw new Error(`MCP operation is not allowed for this child: ${args.server}`);
+		};
+		const mcpSchemas: TSchema[] = [];
+		for (const access of request.mcp ?? []) {
+			mcpSchemas.push(Type.Object({ action: Type.Literal("discover"), server: Type.Literal(access.server) }));
+			if (access.names.length)
+				mcpSchemas.push(
+					Type.Object({
+						action: Type.Literal("call"),
+						server: Type.Literal(access.server),
+						name: Type.Union(access.names.map((name) => Type.Literal(name))),
+						arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+					}),
+				);
+		}
+		const executeHostTool = async (
+			name: string,
+			args: unknown,
+			effectiveSignal: AbortSignal,
+		): Promise<ExtensionToolResult> => {
+			effectiveSignal.throwIfAborted();
+			if (!hostToolNames.has(name) || !api.getActiveTools().includes(name))
+				throw new Error(`Tool ${name} is not in the child host-tool allowlist`);
+			if (name === "mcp") assertMcpAccess(args);
+			const { context: childContext, assistantMessage } = currentExecution();
+			const result = await api.executeTool(name, args, {
+				signal: effectiveSignal,
+				context: childContext,
+				assistantMessage,
+			});
+			if (
+				name !== "mcp" ||
+				request.mcp === undefined ||
+				!isRecord(args) ||
+				args.action !== "discover" ||
+				result.isError
+			)
+				return result;
+			const text = result.content
+				.filter((part): part is TextContent => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
+			const discovery: unknown = JSON.parse(text);
+			if (!isRecord(discovery) || !Array.isArray(discovery.tools))
+				throw new Error("MCP discovery returned an invalid tool index");
+			const allowedNames = new Set(
+				request.mcp.filter((access) => access.server === args.server).flatMap((access) => [...access.names]),
+			);
+			const tools = discovery.tools.filter(
+				(tool) => isRecord(tool) && typeof tool.name === "string" && allowedNames.has(tool.name),
+			);
+			return {
+				...result,
+				content: [{ type: "text", text: JSON.stringify({ server: args.server, tools }) }],
+				details: {},
+			};
+		};
 		const customTools: ToolDefinition[] = available.map((tool) => ({
 			name: tool.name,
 			label: tool.name,
 			description: tool.description,
 			...(tool.promptGuidelines ? { promptGuidelines: tool.promptGuidelines } : {}),
-			parameters: tool.parameters,
+			parameters: tool.name === "mcp" && request.mcp !== undefined ? Type.Union(mcpSchemas) : tool.parameters,
 			execute: async (_toolCallId, params, toolSignal) => {
 				const effectiveSignal = toolSignal ? AbortSignal.any([signal, toolSignal]) : signal;
-				effectiveSignal.throwIfAborted();
-				if (!hostToolNames.has(tool.name))
-					throw new Error(`Parent host tool is no longer in the child allowlist: ${tool.name}`);
-				const { context: childContext, assistantMessage } = currentExecution();
-				const result = await api.executeTool(tool.name, params, {
-					signal: effectiveSignal,
-					context: childContext,
-					assistantMessage,
-				});
-				return requireSuccessfulHostTool(tool.name, result);
+				return requireSuccessfulHostTool(tool.name, await executeHostTool(tool.name, params, effectiveSignal));
 			},
 		}));
+
 		const codeMode = new CodeModeSessionManager({
 			dispatcher: async (name, args, toolSignal) => {
-				if (name === "tool_info") {
+				const effectiveSignal = AbortSignal.any([signal, toolSignal]);
+				effectiveSignal.throwIfAborted();
+				if (name === "tool_info" || name === CHILD_MESSAGE_TOOL) {
 					if (!childSession) throw new Error("Subagent session is not ready");
-					return childSession.extensionRunner
-						.createContext()
-						.executeTool(name, args, { signal: AbortSignal.any([signal, toolSignal]) });
+					return childSession.extensionRunner.createContext().executeTool(name, args, { signal: effectiveSignal });
 				}
-				if (!hostToolNames.has(name)) throw new Error(`Tool ${name} is not in the child host-tool allowlist`);
-				const { context: childContext, assistantMessage } = currentExecution();
-				return api.executeTool(name, args, {
-					signal: AbortSignal.any([signal, toolSignal]),
-					context: childContext,
-					assistantMessage,
-				});
+				return executeHostTool(name, args, effectiveSignal);
 			},
 		});
+		customTools.push(
+			parentMessageTool(
+				callbacks,
+				signal,
+				() => codeMode.getSession(sessionManager.getSessionId())?.pauseTimeout() ?? (() => {}),
+			),
+		);
 		customTools.push(codeTool(sessionManager.getSessionId(), codeMode, context.cwd));
 		const childFactory = childHooksFactory(options);
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: context.cwd,
 			agentDir: childAgentDir,
 			settingsManager,
-			systemPrompt: context.getSystemPrompt(),
+			systemPrompt: options.systemPrompt,
 			appendSystemPrompt: [
 				"You are a subagent with an explicitly delegated task. Keep inherited approval boundaries. Do not start Goals or delegate again. Report verified results and remaining uncertainty to the parent.",
 			],
 			noExtensions: true,
-			noSkills: false,
+			noSkills: true,
 			noPromptTemplates: true,
 			noThemes: true,
 			noContextFiles: !context.isProjectTrusted(),
-			additionalSkillPaths: [...(options.inheritedSkillPaths ?? [])],
 			extensionFactories: [{ name: "personal-harness-child-hooks", factory: childFactory }],
 		});
 		try {
@@ -301,6 +435,10 @@ export function createPiSubagentSessionFactory(
 			prompt: async (text) => {
 				signal.throwIfAborted();
 				await session.prompt(text, { expandPromptTemplates: false });
+			},
+			send: async (text) => {
+				signal.throwIfAborted();
+				await session.steer(text);
 			},
 			abort: async () => {
 				unsubscribeAbort();

@@ -120,6 +120,7 @@ export function createPersonalHarnessProfile(options: PersonalHarnessProfileOpti
 	const serverNames = Object.keys(options.mcpServers ?? {}).sort();
 	const harnessExtension = createPersonalHarnessExtension({
 		...extensionOptions,
+		...(systemPrompt === undefined ? {} : { childSystemPrompt: systemPrompt }),
 		inheritedSkillPaths: skillPaths,
 	});
 	const extensionFactory: ExtensionFactory = (pi) => {

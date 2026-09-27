@@ -2,14 +2,25 @@ import { randomUUID } from "node:crypto";
 import type { AgentEvent, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { type HarnessUsageLedger, reportedModelUsage } from "./usage.ts";
 
+export interface HarnessSubagentMcpAccess {
+	server: string;
+	names: readonly string[];
+}
 export interface HarnessSubagentRequest {
 	task: string;
+	context?: string;
 	provider: string;
 	model: string;
 	thinking: ThinkingLevel;
+	allowedTools?: readonly string[];
+	mcp?: readonly HarnessSubagentMcpAccess[];
+}
+export interface HarnessSubagentCallbacks {
+	onMessage: (text: string, waitForReply: boolean, signal: AbortSignal) => Promise<string | undefined>;
 }
 export interface HarnessChildSession {
 	prompt(text: string): Promise<void>;
+	send(text: string): Promise<void>;
 	abort(): Promise<void>;
 	dispose(): Promise<void>;
 	getLastAssistantText(): string | undefined;
@@ -24,6 +35,13 @@ export interface HarnessSubagentResult {
 	error?: string;
 	durationMs: number;
 }
+export interface HarnessSubagentMessage {
+	id: string;
+	text: string;
+}
+export type HarnessSubagentWait =
+	| { type: "message"; message: HarnessSubagentMessage }
+	| { type: "result"; result: HarnessSubagentResult };
 export interface HarnessSubagentInfo {
 	id: string;
 	status: "queued" | "running" | HarnessSubagentResult["status"];
@@ -31,10 +49,25 @@ export interface HarnessSubagentInfo {
 	model: string;
 }
 export interface HarnessSubagentOptions {
-	createSession: (request: HarnessSubagentRequest, signal: AbortSignal) => Promise<HarnessChildSession>;
+	createSession: (
+		request: HarnessSubagentRequest,
+		signal: AbortSignal,
+		callbacks: HarnessSubagentCallbacks,
+	) => Promise<HarnessChildSession>;
 	ledger: HarnessUsageLedger;
 	maxParallel?: number;
+	onMessage?: (message: HarnessSubagentMessage, waiting: boolean) => void;
 	onResult?: (result: HarnessSubagentResult, waiting: boolean) => void;
+}
+interface ChildWaiter {
+	resolve: (value: HarnessSubagentWait) => void;
+	reject: (reason: unknown) => void;
+}
+interface ParentReplyWaiter {
+	resolve: (text: string) => void;
+	reject: (reason: unknown) => void;
+	signal: AbortSignal;
+	onAbort: () => void;
 }
 interface ChildJob {
 	id: string;
@@ -45,7 +78,10 @@ interface ChildJob {
 	resolve: (result: HarnessSubagentResult) => void;
 	session?: HarnessChildSession;
 	result?: HarnessSubagentResult;
-	waiters: number;
+	waiters: ChildWaiter[];
+	messages: HarnessSubagentMessage[];
+	replyWaiters: ParentReplyWaiter[];
+	pendingParentMessages: string[];
 	startedAt: number;
 }
 
@@ -72,12 +108,21 @@ export class HarnessSubagents {
 		const deferred = Promise.withResolvers<HarnessSubagentResult>();
 		const job: ChildJob = {
 			id: randomUUID(),
-			request: { ...request },
+			request: {
+				...request,
+				...(request.allowedTools === undefined ? {} : { allowedTools: [...request.allowedTools] }),
+				...(request.mcp === undefined
+					? {}
+					: { mcp: request.mcp.map(({ server, names }) => ({ server, names: [...names] })) }),
+			},
 			status: "queued",
 			controller: new AbortController(),
 			completion: deferred.promise,
 			resolve: deferred.resolve,
-			waiters: 0,
+			waiters: [],
+			messages: [],
+			replyWaiters: [],
+			pendingParentMessages: [],
 			startedAt: performance.now(),
 		};
 		this.#jobs.set(job.id, job);
@@ -101,20 +146,46 @@ export class HarnessSubagents {
 		return job.result ? { ...job.result } : undefined;
 	}
 
-	async wait(id: string, signal?: AbortSignal): Promise<HarnessSubagentResult> {
+	async wait(id: string, signal?: AbortSignal): Promise<HarnessSubagentWait> {
 		const job = this.#jobs.get(id);
 		if (!job) throw new Error("Unknown subagent");
 		signal?.throwIfAborted();
-		if (job.result) return { ...job.result };
-		job.waiters++;
-		const interrupted = Promise.withResolvers<never>();
-		const abort = () => interrupted.reject(signal?.reason ?? new Error("Wait aborted"));
+		const message = job.messages.shift();
+		if (message) return { type: "message", message: { ...message } };
+		if (job.result) return { type: "result", result: { ...job.result } };
+
+		const deferred = Promise.withResolvers<HarnessSubagentWait>();
+		const waiter: ChildWaiter = { resolve: deferred.resolve, reject: deferred.reject };
+		const abort = () => {
+			const index = job.waiters.indexOf(waiter);
+			if (index !== -1) job.waiters.splice(index, 1);
+			deferred.reject(signal?.reason ?? new Error("Wait aborted"));
+		};
+		job.waiters.push(waiter);
 		signal?.addEventListener("abort", abort, { once: true });
+		if (signal?.aborted) abort();
 		try {
-			return { ...(await Promise.race([job.completion, interrupted.promise])) };
+			return await deferred.promise;
 		} finally {
-			job.waiters--;
+			const index = job.waiters.indexOf(waiter);
+			if (index !== -1) job.waiters.splice(index, 1);
 			signal?.removeEventListener("abort", abort);
+		}
+	}
+
+	async send(id: string, message: string): Promise<void> {
+		const job = this.#jobs.get(id);
+		if (!job) throw new Error("Unknown subagent");
+		if (!message.trim()) throw new Error("A parent message is required");
+		if (job.result || job.status !== "running") throw new Error("Subagent is not active");
+		const replyWaiter = job.replyWaiters.shift();
+		if (replyWaiter) {
+			replyWaiter.signal.removeEventListener("abort", replyWaiter.onAbort);
+			replyWaiter.resolve(message);
+		} else if (job.session) {
+			await job.session.send(message);
+		} else {
+			job.pendingParentMessages.push(message);
 		}
 	}
 
@@ -138,7 +209,10 @@ export class HarnessSubagents {
 				completion: Promise.resolve(result),
 				resolve: () => {},
 				result: { ...result },
-				waiters: 0,
+				waiters: [],
+				messages: [],
+				replyWaiters: [],
+				pendingParentMessages: [],
 				startedAt: 0,
 			});
 		}
@@ -172,6 +246,45 @@ export class HarnessSubagents {
 		}
 	}
 
+	async #receiveMessage(
+		job: ChildJob,
+		text: string,
+		waitForReply: boolean,
+		signal: AbortSignal,
+	): Promise<string | undefined> {
+		signal.throwIfAborted();
+		if (job.result || job.status !== "running") throw new Error("Subagent is not active");
+		if (!text.trim()) throw new Error("A child message is required");
+
+		let reply: Promise<string> | undefined;
+		if (waitForReply) {
+			const deferred = Promise.withResolvers<string>();
+			let waiter: ParentReplyWaiter;
+			const onAbort = () => {
+				const index = job.replyWaiters.indexOf(waiter);
+				if (index !== -1) job.replyWaiters.splice(index, 1);
+				deferred.reject(signal.reason ?? new Error("Parent reply wait aborted"));
+			};
+			waiter = {
+				resolve: deferred.resolve,
+				reject: deferred.reject,
+				signal,
+				onAbort,
+			};
+			job.replyWaiters.push(waiter);
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) onAbort();
+			reply = deferred.promise;
+		}
+
+		const message = { id: job.id, text };
+		const waiting = job.waiters.shift();
+		if (waiting) waiting.resolve({ type: "message", message });
+		else job.messages.push(message);
+		this.#options.onMessage?.({ ...message }, waiting !== undefined);
+		return reply ? await reply : undefined;
+	}
+
 	async #run(job: ChildJob): Promise<void> {
 		let unsubscribe: (() => void) | undefined;
 		let lastError: string | undefined;
@@ -180,7 +293,9 @@ export class HarnessSubagents {
 		let text = "";
 		let errorMessage: string | undefined;
 		try {
-			job.session = await this.#options.createSession(job.request, job.controller.signal);
+			job.session = await this.#options.createSession(job.request, job.controller.signal, {
+				onMessage: (message, waitForReply, signal) => this.#receiveMessage(job, message, waitForReply, signal),
+			});
 			job.controller.signal.throwIfAborted();
 			unsubscribe = job.session.subscribe((event) => {
 				if (event.type === "turn_start") turnStarted = performance.now();
@@ -197,7 +312,11 @@ export class HarnessSubagents {
 					durationMs: performance.now() - turnStarted,
 				});
 			});
-			await job.session.prompt(job.request.task);
+			for (const message of job.pendingParentMessages.splice(0)) await job.session.send(message);
+			const prompt = job.request.context?.trim()
+				? `${job.request.task}\n\nContext from the parent:\n${job.request.context}`
+				: job.request.task;
+			await job.session.prompt(prompt);
 			text = job.session.getLastAssistantText() ?? "";
 			status = job.controller.signal.aborted ? "cancelled" : lastError ? "failed" : "completed";
 			errorMessage = lastError;
@@ -229,7 +348,14 @@ export class HarnessSubagents {
 			...(error ? { error } : {}),
 			durationMs: performance.now() - job.startedAt,
 		};
+		const result = { ...job.result };
+		const waiting = job.waiters.length > 0;
+		for (const waiter of job.waiters.splice(0)) waiter.resolve({ type: "result", result: { ...result } });
+		for (const waiter of job.replyWaiters.splice(0)) {
+			waiter.signal.removeEventListener("abort", waiter.onAbort);
+			waiter.reject(new Error("Subagent finished before the parent replied"));
+		}
 		job.resolve(job.result);
-		this.#options.onResult?.({ ...job.result }, job.waiters > 0);
+		this.#options.onResult?.(result, waiting);
 	}
 }

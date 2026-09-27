@@ -31,6 +31,35 @@ function outputsOfType(result: CodeModeExecutionResult, type: CodeModeOutputType
 }
 
 describe("personal harness Code Mode", () => {
+	it("excludes an explicit parent reply wait from the cell deadline and resumes timing afterwards", async () => {
+		const entered = Promise.withResolvers<void>();
+		const reply = Promise.withResolvers<string>();
+		const session = createSession("parent-reply", async () => {
+			const release = session.pauseTimeout();
+			entered.resolve();
+			try {
+				return await reply.promise;
+			} finally {
+				release();
+			}
+		});
+		await session.execute("javascript", "1");
+		const pending = session.execute("javascript", "await tool.parent_reply({})", { timeoutMs: 200 });
+		await entered.promise;
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		reply.resolve("reply received");
+		const result = await pending;
+		expect(result.error).toBeUndefined();
+		expect(outputsOfType(result, "result")).toEqual(["reply received"]);
+		const resumed = await session.execute(
+			"javascript",
+			"await tool.parent_reply({}); await new Promise(resolve=>setTimeout(resolve,400));",
+			{ timeoutMs: 200 },
+		);
+		expect(resumed.interrupted).toBe(true);
+		expect(resumed.error?.name).toBe("TimeoutError");
+	});
+
 	it("keeps JavaScript bindings, supports top-level await, and routes parallel tools through the dispatcher", async () => {
 		const calls: Array<{ name: string; args: unknown; signal: AbortSignal }> = [];
 		let inFlight = 0;

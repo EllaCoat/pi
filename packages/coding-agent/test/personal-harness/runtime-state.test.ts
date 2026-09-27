@@ -2,7 +2,11 @@ import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { Usage } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import { HarnessGoalStore } from "../../src/personal-harness/goal.ts";
-import { type HarnessChildSession, HarnessSubagents } from "../../src/personal-harness/subagents.ts";
+import {
+	type HarnessChildSession,
+	type HarnessSubagentResult,
+	HarnessSubagents,
+} from "../../src/personal-harness/subagents.ts";
 import { HarnessUsageLedger, reportedModelUsage } from "../../src/personal-harness/usage.ts";
 
 function child(text: string, pending?: Promise<void>): HarnessChildSession {
@@ -10,11 +14,22 @@ function child(text: string, pending?: Promise<void>): HarnessChildSession {
 		prompt: async () => {
 			if (pending) await pending;
 		},
+		send: async () => {},
 		abort: async () => {},
 		dispose: async () => {},
 		getLastAssistantText: () => text,
 		subscribe: (_listener: (event: AgentEvent) => void) => () => {},
 	};
+}
+
+async function waitForResult(
+	manager: HarnessSubagents,
+	id: string,
+	signal?: AbortSignal,
+): Promise<HarnessSubagentResult> {
+	const outcome = await manager.wait(id, signal);
+	if (outcome.type !== "result") throw new Error("Expected the child final result");
+	return outcome.result;
 }
 const request = { task: "Inspect a fixture", provider: "fixture", model: "one", thinking: "off" as const };
 const usage: Usage = {
@@ -37,14 +52,72 @@ describe("personal harness runtime state", () => {
 		});
 		const first = manager.start(request);
 		const second = manager.start({ ...request, model: "two" });
-		const [one, two] = await Promise.all([manager.wait(first.id), manager.wait(second.id)]);
+		const [one, two] = await Promise.all([waitForResult(manager, first.id), waitForResult(manager, second.id)]);
 		expect([one.text, two.text]).toEqual(["one", "two"]);
 		expect(manager.list().map((item) => item.status)).toEqual(["completed", "completed"]);
-		expect(await manager.wait(first.id)).toEqual(one);
+		expect(await waitForResult(manager, first.id)).toEqual(one);
 		expect(manager.result(second.id)).toEqual(two);
 		expect(factory).toHaveBeenCalledTimes(2);
 		expect(delivered).toHaveBeenCalledTimes(2);
 		expect(delivered.mock.calls.every((call) => call[1] === true)).toBe(true);
+		await manager.close();
+	});
+
+	it("delivers a child question once, accepts a direct reply and steering, then returns the final result", async () => {
+		const replyReceived = Promise.withResolvers<void>();
+		const finishChild = Promise.withResolvers<void>();
+		const prompts: string[] = [];
+		const replies: string[] = [];
+		const sentToChild: string[] = [];
+		const notified = vi.fn();
+		const delivered = vi.fn();
+		const manager = new HarnessSubagents({
+			createSession: async (_request, signal, callbacks) => ({
+				prompt: async (text) => {
+					prompts.push(text);
+					const reply = await callbacks.onMessage("Should I inspect the generated output?", true, signal);
+					replies.push(reply ?? "");
+					replyReceived.resolve();
+					await finishChild.promise;
+				},
+				send: async (text) => {
+					sentToChild.push(text);
+				},
+				abort: async () => finishChild.resolve(),
+				dispose: async () => {},
+				getLastAssistantText: () => replies[0] ?? "",
+				subscribe: () => () => {},
+			}),
+			ledger: new HarnessUsageLedger(),
+			onMessage: notified,
+			onResult: delivered,
+		});
+		const job = manager.start({ ...request, context: "Only compare the generated output with fixture A." });
+		const messageWaiting = manager.wait(job.id);
+		const message = await messageWaiting;
+		expect(message).toEqual({
+			type: "message",
+			message: { id: job.id, text: "Should I inspect the generated output?" },
+		});
+		expect(notified).toHaveBeenCalledOnce();
+		expect(notified).toHaveBeenCalledWith({ id: job.id, text: "Should I inspect the generated output?" }, true);
+
+		await manager.send(job.id, "Inspect fixture A only.");
+		await replyReceived.promise;
+		const finalWaiting = manager.wait(job.id);
+		await manager.send(job.id, "Keep the comparison short.");
+		expect(replies).toEqual(["Inspect fixture A only."]);
+		expect(sentToChild).toEqual(["Keep the comparison short."]);
+		expect(prompts[0]).toContain("Context from the parent:\nOnly compare the generated output with fixture A.");
+
+		finishChild.resolve();
+		const final = await finalWaiting;
+		expect(final.type).toBe("result");
+		expect(delivered).toHaveBeenCalledOnce();
+		expect(delivered.mock.calls[0]?.[1]).toBe(true);
+		if (final.type !== "result") throw new Error("Expected the child final result");
+		expect(manager.result(job.id)).toEqual(final.result);
+		await expect(manager.send(job.id, "Too late")).rejects.toThrow("Subagent is not active");
 		await manager.close();
 	});
 
@@ -59,9 +132,9 @@ describe("personal harness runtime state", () => {
 		const first = manager.start(request);
 		const queued = manager.start({ ...request, model: "queued" });
 		await manager.cancel(queued.id);
-		expect((await manager.wait(queued.id)).status).toBe("cancelled");
+		expect((await waitForResult(manager, queued.id)).status).toBe("cancelled");
 		pending.resolve();
-		expect((await manager.wait(first.id)).status).toBe("completed");
+		expect((await waitForResult(manager, first.id)).status).toBe("completed");
 		expect(factory).toHaveBeenCalledTimes(1);
 		await manager.close();
 	});
@@ -79,7 +152,7 @@ describe("personal harness runtime state", () => {
 		await expect(waiting).rejects.toThrow("stop waiting");
 		expect(manager.list()[0].status).toBe("running");
 		pending.resolve();
-		expect((await manager.wait(job.id)).text).toBe("finished");
+		expect((await waitForResult(manager, job.id)).text).toBe("finished");
 		await manager.close();
 	});
 
@@ -100,6 +173,7 @@ describe("personal harness runtime state", () => {
 					abort: async () => {
 						pending.resolve();
 					},
+					send: async () => {},
 					dispose: async () => {
 						disposed.resolve();
 					},
@@ -117,7 +191,7 @@ describe("personal harness runtime state", () => {
 		expect(manager.result(running.id)?.status).toBe("cancelled");
 
 		const next = manager.start({ ...request, task: "Continue independently" });
-		expect((await manager.wait(next.id)).status).toBe("completed");
+		expect((await waitForResult(manager, next.id)).status).toBe("completed");
 		await manager.close();
 	});
 	it("restores settled results without allocating a model session", async () => {
@@ -126,7 +200,7 @@ describe("personal harness runtime state", () => {
 		manager.restore([
 			{ id: "old", provider: "fixture", model: "one", status: "completed", text: "saved result", durationMs: 5 },
 		]);
-		expect((await manager.wait("old")).text).toBe("saved result");
+		expect((await waitForResult(manager, "old")).text).toBe("saved result");
 		expect(factory).not.toHaveBeenCalled();
 		await manager.close();
 	});

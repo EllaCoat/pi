@@ -38,6 +38,8 @@ import { branchIdForEntries, latestTodoSnapshot, memoryRecordsFromBranch } from 
 import { createPiSubagentSessionFactory } from "./subagent-factory.ts";
 import {
 	type HarnessChildSession,
+	type HarnessSubagentCallbacks,
+	type HarnessSubagentMessage,
 	type HarnessSubagentRequest,
 	type HarnessSubagentResult,
 	HarnessSubagents,
@@ -61,15 +63,25 @@ const EvalParameters = Type.Object({
 	language: Type.Union([Type.Literal("javascript"), Type.Literal("python")]),
 	code: Type.String({ minLength: 1 }),
 });
+
 const TaskParameters = Type.Object({
 	action: Type.Union([
 		Type.Literal("spawn"),
+		Type.Literal("send"),
 		Type.Literal("list"),
 		Type.Literal("wait"),
 		Type.Literal("result"),
 		Type.Literal("cancel"),
 	]),
 	task: Type.Optional(Type.String()),
+	context: Type.Optional(Type.String()),
+	message: Type.Optional(Type.String({ minLength: 1 })),
+	allowedTools: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+	mcp: Type.Optional(
+		Type.Array(
+			Type.Object({ server: Type.String({ minLength: 1 }), names: Type.Array(Type.String({ minLength: 1 })) }),
+		),
+	),
 	provider: Type.Optional(Type.String()),
 	model: Type.Optional(Type.String()),
 	thinking: Type.Optional(
@@ -190,6 +202,7 @@ const MemoryCurateSchema = Type.Object({
 export type PersonalHarnessChildSessionFactory = (
 	request: HarnessSubagentRequest,
 	signal: AbortSignal,
+	callbacks: HarnessSubagentCallbacks,
 ) => Promise<HarnessChildSession>;
 
 export interface PersonalHarnessJevOptions {
@@ -209,6 +222,8 @@ export interface PersonalHarnessExtensionOptions {
 	readonly inheritedSkillPaths?: readonly string[];
 	readonly hookValues?: Omit<Partial<HarnessHookOptions>, "evaluate" | "hold" | "ledger">;
 	readonly backgroundTodoModel?: HarnessModelSelection;
+
+	readonly childSystemPrompt?: string;
 	readonly maxParallelChildren?: number;
 	readonly todoDebounceMs?: number;
 	readonly createMcpClient?: (options: HarnessMcpClientOptions) => HarnessMcpClient;
@@ -234,6 +249,7 @@ interface ActiveHarnessSession {
 	entryHolds: number;
 	pendingEntries: DeferredSessionEntry[];
 	pendingChildNotifications: HarnessSubagentResult[];
+	pendingChildMessages: HarnessSubagentMessage[];
 	indexedLength: number;
 	indexedTailId: string | null;
 }
@@ -263,7 +279,7 @@ function boundedRedactedText(value: string, limit: number): string {
 	const safe = redactSensitiveText(value)
 		.text.replace(/[\r\n\t]+/gu, " ")
 		.trim();
-	return safe.length > limit ? `${safe.slice(0, limit)}…` : safe;
+	return safe.length > limit ? `${safe.slice(0, limit - 1)}…` : safe;
 }
 
 function modelToolResult(response: AssistantMessage, toolName: string, parameters: TSchema): unknown {
@@ -546,9 +562,9 @@ function promptMetadata(result: HarnessMcpGetPromptResult): unknown {
 
 function taskResultText(result: HarnessSubagentResult): string {
 	const lines = [`Task ${result.id}: ${result.status} (${result.provider}/${result.model})`];
-	if (result.error) lines.push(`Error: ${boundedRedactedText(result.error, 300)}`);
-	if (result.text) lines.push(boundedRedactedText(result.text, 3_000));
-	return lines.join("\n");
+	if (result.error) lines.push(`Error: ${result.error}`);
+	if (result.text) lines.push(result.text);
+	return boundedRedactedText(lines.join("\n"), 10_000);
 }
 
 function outputText(output: CodeModeOutput): string {
@@ -603,9 +619,17 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 			if (record.usage) active?.goal.recordUsage(record.usage);
 		});
 		const codeMode = new CodeModeSessionManager({
-			dispatcher: (name, args, signal) => {
+			dispatcher: async (name, args, signal) => {
 				if (name === "eval") throw new Error("Recursive Code Mode execution is not supported");
-				return pi.executeTool(name, args, { signal });
+				const release =
+					name === "task" && isRecord(args) && args.action === "wait" && active
+						? codeMode.getSession(active.scopeKey)?.pauseTimeout()
+						: undefined;
+				try {
+					return await pi.executeTool(name, args, { signal });
+				} finally {
+					release?.();
+				}
 			},
 		});
 		const clients: Record<string, HarnessMcpClient> = {};
@@ -749,6 +773,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 			if (active !== scope || scope.controller.signal.aborted) return;
 			for (const entry of entries) pi.appendEntry(entry.customType, entry.data);
 			for (const result of scope.pendingChildNotifications.splice(0)) notifyChild(scope, result);
+			for (const message of scope.pendingChildMessages.splice(0)) notifyChildMessage(scope, message);
 		}
 
 		function acquireCompressionHold(): () => void {
@@ -778,6 +803,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 			scope.controller.abort(new Error("Personal harness session scope ended"));
 			scope.pendingEntries = [];
 			scope.pendingChildNotifications = [];
+			scope.pendingChildMessages = [];
 			scope.scheduler.shutdown();
 			const tasks = scope.subagents.close();
 			return Promise.all([codeMode.shutdownSession(scope.scopeKey), tasks]).then(() => undefined);
@@ -846,7 +872,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 					api: pi,
 					context,
 					dataDir,
-					inheritedSkillPaths: options.inheritedSkillPaths,
+					systemPrompt: options.childSystemPrompt,
 					hookValues: options.hookValues,
 					evaluate: evaluateHooks,
 					ledger: usage,
@@ -855,6 +881,12 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 				createSession: createChildSession,
 				ledger: usage,
 				maxParallel: options.maxParallelChildren,
+				onMessage: (message, waiting) => {
+					const scope = active;
+					if (scope?.scopeKey !== scopeKey || waiting || scope.controller.signal.aborted) return;
+					if (scope.entryHolds > 0) scope.pendingChildMessages.push(message);
+					else notifyChildMessage(scope, message);
+				},
 				onResult: (result, waiting) => {
 					const scope = active;
 					if (scope?.scopeKey === scopeKey) childResultNotification(scope, result, waiting);
@@ -874,6 +906,7 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 				entryHolds: 0,
 				pendingEntries: [],
 				pendingChildNotifications: [],
+				pendingChildMessages: [],
 				indexedLength: processedLength,
 				indexedTailId: branch[processedLength - 1]?.id ?? null,
 			};
@@ -927,6 +960,19 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 				return;
 			}
 			notifyChild(scope, result);
+		}
+
+		function notifyChildMessage(scope: ActiveHarnessSession, message: HarnessSubagentMessage): void {
+			if (active !== scope || scope.controller.signal.aborted) return;
+			pi.sendMessage(
+				{
+					customType: "personal-harness-child-message",
+					content: boundedRedactedText(`Task ${message.id} message:\n${message.text}`, 10_000),
+					display: false,
+					details: { taskId: message.id },
+				},
+				{ triggerTurn: false },
+			);
 		}
 
 		function notifyChild(scope: ActiveHarnessSession, result: HarnessSubagentResult): void {
@@ -1110,7 +1156,8 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		pi.registerTool({
 			name: "task",
 			label: "personal task",
-			description: "Spawn, list, wait for, retrieve, or cancel an independent child session.",
+			description:
+				"Spawn, message, inspect, or cancel an independent child. Waiting returns an intermediate message or the final result.",
 			promptSnippet: "Delegate a task with an explicit provider, model, and thinking level.",
 			parameters: TaskParameters,
 			constrainedSampling: { type: "json_schema", strict: "prefer" },
@@ -1126,11 +1173,19 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 							provider: params.provider,
 							model: params.model,
 							thinking: params.thinking,
+							context: params.context,
+							allowedTools: params.allowedTools,
+							mcp: params.mcp,
 						}),
 					);
 				}
 				if (params.action === "list") return jsonResult(scope.subagents.list());
 				if (!params.id) return toolResult(`${params.action} requires a task id`, true);
+				if (params.action === "send") {
+					if (!params.message) return toolResult("send requires a message", true);
+					await scope.subagents.send(params.id, params.message);
+					return jsonResult({ sent: true, id: params.id });
+				}
 				if (params.action === "wait") return jsonResult(await scope.subagents.wait(params.id, signal));
 				if (params.action === "result")
 					return jsonResult(scope.subagents.result(params.id) ?? { id: params.id, status: "running" });

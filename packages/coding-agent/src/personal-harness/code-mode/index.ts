@@ -82,6 +82,7 @@ export class CodeModeSession {
 		language: CodeModeLanguage;
 		controller: AbortController;
 		promise: Promise<CodeModeExecutionResult>;
+		pauseTimeout: () => () => void;
 	};
 	#closed = false;
 	#lifecycleBusy = false;
@@ -122,21 +123,49 @@ export class CodeModeSession {
 		const abortFromCaller = () => controller.abort(callerSignal?.reason ?? new Error("Code Mode execution aborted"));
 		if (callerSignal?.aborted) abortFromCaller();
 		else callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
-		const timeout = setTimeout(() => {
+		let remainingMs = timeoutMs;
+		let deadline = performance.now() + remainingMs;
+		let holds = 0;
+		let settled = false;
+		const onTimeout = () => {
 			const error = new Error(`Code Mode cell exceeded ${timeoutMs} ms`);
 			error.name = "TimeoutError";
 			controller.abort(error);
-		}, timeoutMs);
+		};
+		let timeout = setTimeout(onTimeout, remainingMs);
+		const pauseTimeout = (): (() => void) => {
+			if (settled || controller.signal.aborted) return () => {};
+			if (holds++ === 0) {
+				remainingMs = Math.max(0, deadline - performance.now());
+				clearTimeout(timeout);
+				if (remainingMs === 0) onTimeout();
+			}
+			let released = false;
+			return () => {
+				if (released) return;
+				released = true;
+				if (--holds === 0 && !settled && !controller.signal.aborted) {
+					deadline = performance.now() + remainingMs;
+					timeout = setTimeout(onTimeout, remainingMs);
+				}
+			};
+		};
 
 		const promise = kernel.execute(code, controller.signal);
-		this.#active = { language, controller, promise };
+		this.#active = { language, controller, promise, pauseTimeout };
 		try {
 			return await promise;
 		} finally {
+			settled = true;
 			clearTimeout(timeout);
 			callerSignal?.removeEventListener("abort", abortFromCaller);
 			if (this.#active?.promise === promise) this.#active = undefined;
 		}
+	}
+
+	/** Parent reply waits do not consume the cell execution deadline; cancellation remains active. */
+	pauseTimeout(): () => void {
+		return this.#active?.pauseTimeout() ?? (() => {});
 	}
 
 	async restart(language?: CodeModeLanguage): Promise<void> {
