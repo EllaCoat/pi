@@ -15,6 +15,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "../core/e
 import type { ModelRegistry } from "../core/model-registry.ts";
 import type { SessionEntry } from "../core/session-manager.ts";
 import { resolvePath } from "../utils/paths.ts";
+import { registerHarnessAsk } from "./ask.ts";
 import { type CodeModeOutput, CodeModeSessionManager } from "./code-mode/index.ts";
 import { HARNESS_GOAL_ENTRY, HarnessGoalStore } from "./goal.ts";
 import { type HarnessHookOptions, installHooks } from "./hooks/index.ts";
@@ -1399,9 +1400,11 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 			},
 		});
 
+		registerHarnessAsk(pi);
+
 		pi.on("tool_result", (event) => {
 			if (
-				["eval", "task", "recall", "memory", "todo", "mcp", "web_search", "usage", "goal"].includes(
+				["ask", "eval", "task", "recall", "memory", "todo", "mcp", "web_search", "usage", "goal"].includes(
 					event.toolName,
 				) &&
 				isRecord(event.details) &&

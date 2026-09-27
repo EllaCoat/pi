@@ -517,6 +517,7 @@ export class InteractiveMode {
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
+	private activeExtensionDialogCancel: (() => void) | undefined;
 	private extensionTerminalInputSubscriptions = new Set<{
 		handler: (data: string) => { consume?: boolean; data?: string } | undefined;
 		unsubscribe: () => void;
@@ -2354,7 +2355,12 @@ export class InteractiveMode {
 		this.renderWidgets();
 	}
 
+	private cancelActiveExtensionDialog(): void {
+		this.activeExtensionDialogCancel?.();
+	}
+
 	private resetExtensionUI(): void {
+		this.cancelActiveExtensionDialog();
 		if (this.extensionSelector) {
 			this.hideExtensionSelector();
 		}
@@ -2597,40 +2603,90 @@ export class InteractiveMode {
 		options: string[],
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
-		return new Promise((resolve) => {
-			if (opts?.signal?.aborted) {
-				resolve(undefined);
-				return;
-			}
+		const { promise, resolve } = Promise.withResolvers<string | undefined>();
+		if (opts?.signal?.aborted) {
+			resolve(undefined);
+			return promise;
+		}
 
-			const onAbort = () => {
-				this.hideExtensionSelector();
-				resolve(undefined);
-			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
+		this.cancelActiveExtensionDialog();
 
-			this.extensionSelector = new ExtensionSelectorComponent(
-				title,
-				options,
-				(option) => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionSelector();
-					resolve(option);
-				},
-				() => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionSelector();
-					resolve(undefined);
-				},
-				{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
-			);
+		let selector: ExtensionSelectorComponent | undefined;
+		let settled = false;
+		let cancel = (): void => {};
+		const finish = (result: string | undefined): void => {
+			if (settled) return;
+			settled = true;
+			opts?.signal?.removeEventListener("abort", cancel);
+			if (this.activeExtensionDialogCancel === cancel) this.activeExtensionDialogCancel = undefined;
+			if (selector && this.extensionSelector === selector) this.hideExtensionSelector();
+			resolve(result);
+		};
+		cancel = () => finish(undefined);
+		opts?.signal?.addEventListener("abort", cancel, { once: true });
 
-			this.disposeActiveSelector();
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionSelector);
-			this.ui.setFocus(this.extensionSelector);
-			this.ui.requestRender();
-		});
+		selector = new ExtensionSelectorComponent(
+			title,
+			options,
+			(option) => finish(option),
+			() => finish(undefined),
+			{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
+		);
+		this.extensionSelector = selector;
+		this.activeExtensionDialogCancel = cancel;
+		this.disposeActiveSelector();
+		this.editorContainer.clear();
+		this.editorContainer.addChild(selector);
+		this.ui.setFocus(selector);
+		this.ui.requestRender();
+		return promise;
+	}
+
+	/**
+	 * Show a text input for extensions.
+	 */
+	private showExtensionInput(
+		title: string,
+		placeholder?: string,
+		opts?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		const { promise, resolve } = Promise.withResolvers<string | undefined>();
+		if (opts?.signal?.aborted) {
+			resolve(undefined);
+			return promise;
+		}
+
+		this.cancelActiveExtensionDialog();
+
+		let input: ExtensionInputComponent | undefined;
+		let settled = false;
+		let cancel = (): void => {};
+		const finish = (result: string | undefined): void => {
+			if (settled) return;
+			settled = true;
+			opts?.signal?.removeEventListener("abort", cancel);
+			if (this.activeExtensionDialogCancel === cancel) this.activeExtensionDialogCancel = undefined;
+			if (input && this.extensionInput === input) this.hideExtensionInput();
+			resolve(result);
+		};
+		cancel = () => finish(undefined);
+		opts?.signal?.addEventListener("abort", cancel, { once: true });
+
+		input = new ExtensionInputComponent(
+			title,
+			placeholder,
+			(value) => finish(value),
+			() => finish(undefined),
+			{ tui: this.ui, timeout: opts?.timeout },
+		);
+		this.extensionInput = input;
+		this.activeExtensionDialogCancel = cancel;
+		this.disposeActiveSelector();
+		this.editorContainer.clear();
+		this.editorContainer.addChild(input);
+		this.ui.setFocus(input);
+		this.ui.requestRender();
+		return promise;
 	}
 
 	/**
@@ -2666,50 +2722,6 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Show a text input for extensions.
-	 */
-	private showExtensionInput(
-		title: string,
-		placeholder?: string,
-		opts?: ExtensionUIDialogOptions,
-	): Promise<string | undefined> {
-		return new Promise((resolve) => {
-			if (opts?.signal?.aborted) {
-				resolve(undefined);
-				return;
-			}
-
-			const onAbort = () => {
-				this.hideExtensionInput();
-				resolve(undefined);
-			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
-
-			this.extensionInput = new ExtensionInputComponent(
-				title,
-				placeholder,
-				(value) => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionInput();
-					resolve(value);
-				},
-				() => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionInput();
-					resolve(undefined);
-				},
-				{ tui: this.ui, timeout: opts?.timeout },
-			);
-
-			this.disposeActiveSelector();
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionInput);
-			this.ui.setFocus(this.extensionInput);
-			this.ui.requestRender();
-		});
-	}
-
-	/**
 	 * Hide the extension input.
 	 */
 	private hideExtensionInput(): void {
@@ -2725,30 +2737,39 @@ export class InteractiveMode {
 	 * Show a multi-line editor for extensions (with Ctrl+G support).
 	 */
 	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
-		return new Promise((resolve) => {
-			this.extensionEditor = new ExtensionEditorComponent(
-				this.ui,
-				this.keybindings,
-				title,
-				prefill,
-				(value) => {
-					this.hideExtensionEditor();
-					resolve(value);
-				},
-				() => {
-					this.hideExtensionEditor();
-					resolve(undefined);
-				},
-				undefined,
-				this.settingsManager.getExternalEditorCommand(),
-			);
+		const { promise, resolve } = Promise.withResolvers<string | undefined>();
+		this.cancelActiveExtensionDialog();
 
-			this.disposeActiveSelector();
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionEditor);
-			this.ui.setFocus(this.extensionEditor);
-			this.ui.requestRender();
-		});
+		let editor: ExtensionEditorComponent | undefined;
+		let settled = false;
+		let cancel = (): void => {};
+		const finish = (value: string | undefined): void => {
+			if (settled) return;
+			settled = true;
+			if (this.activeExtensionDialogCancel === cancel) this.activeExtensionDialogCancel = undefined;
+			if (editor && this.extensionEditor === editor) this.hideExtensionEditor();
+			resolve(value);
+		};
+		cancel = () => finish(undefined);
+
+		editor = new ExtensionEditorComponent(
+			this.ui,
+			this.keybindings,
+			title,
+			prefill,
+			(value) => finish(value),
+			cancel,
+			undefined,
+			this.settingsManager.getExternalEditorCommand(),
+		);
+		this.extensionEditor = editor;
+		this.activeExtensionDialogCancel = cancel;
+		this.disposeActiveSelector();
+		this.editorContainer.clear();
+		this.editorContainer.addChild(editor);
+		this.ui.setFocus(editor);
+		this.ui.requestRender();
+		return promise;
 	}
 
 	/**
@@ -2767,6 +2788,8 @@ export class InteractiveMode {
 	 * Pass undefined to restore the default editor.
 	 */
 	private setCustomEditorComponent(factory: EditorFactory | undefined): void {
+		this.cancelActiveExtensionDialog();
+
 		this.editorComponentFactory = factory;
 
 		// Save text from current editor before switching
@@ -2872,6 +2895,7 @@ export class InteractiveMode {
 	): Promise<T> {
 		const savedText = this.editor.getText();
 		const isOverlay = options?.overlay ?? false;
+		if (!isOverlay) this.cancelActiveExtensionDialog();
 
 		const restoreEditor = () => {
 			this.editorContainer.clear();
@@ -4721,6 +4745,7 @@ export class InteractiveMode {
 	private showSelector(
 		create: (done: () => void) => { component: Component; focus: Component; dispose?: () => void },
 	): void {
+		this.cancelActiveExtensionDialog();
 		const token = {};
 		let dispose: (() => void) | undefined;
 		const done = () => {
@@ -6832,6 +6857,7 @@ export class InteractiveMode {
 	}
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		this.cancelActiveExtensionDialog();
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);

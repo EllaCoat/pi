@@ -713,7 +713,7 @@ describe("personal harness extension in an AgentSession", () => {
 		expect(resultText(harness, "eval")[0]).toContain("BRIDGE_READY");
 		expect(requests[0].evalDescription).toContain("await tool.tool_info({})");
 		expect(requests[0].evalDescription).toContain('tool.tool_info({name: "NAME"})');
-		expect(requests[0].names.sort()).toEqual(["eval", "todo"]);
+		expect(requests[0].names.sort()).toEqual(["ask", "eval", "todo"]);
 		expect(requests[0].system).toContain("LEGACY_APPEND_MARKER");
 		for (const prompt of legacyPromptViews) {
 			expect(prompt).not.toContain("HIDDEN_SNIPPET_SENTINEL");
