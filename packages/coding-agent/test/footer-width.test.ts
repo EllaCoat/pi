@@ -217,7 +217,7 @@ describe("FooterComponent width handling", () => {
 		});
 		const footer = new FooterComponent(session, createFooterData(1));
 
-		expect(stripAnsi(footer.render(120)[0])).toContain("API換算 ≈$0.7500");
+		expect(stripAnsi(footer.render(120)[0])).toContain("API換算 ≈$0.75");
 	});
 
 	it("shows an unknown marker instead of treating unknown child cost as free", () => {
@@ -227,10 +227,10 @@ describe("FooterComponent width handling", () => {
 		});
 		const footer = new FooterComponent(session, createFooterData(1));
 
-		expect(stripAnsi(footer.render(120)[0])).toContain("API換算 ≈$0.0000+?");
+		expect(stripAnsi(footer.render(120)[0])).toContain("API換算 ≈$0.00+?");
 	});
 
-	it("keeps model, effort, API-equivalent cost, context percent, and bar visible at 40, 80, and 120 columns", () => {
+	it("keeps the model, effort value, cost, context percent, and bar visible at 40, 80, and 120 columns", () => {
 		const session = createSession({
 			sessionName: "",
 			modelId: "gpt-test",
@@ -250,10 +250,56 @@ describe("FooterComponent width handling", () => {
 			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 			const text = stripAnsi(lines.join(" "));
 			expect(text).toContain("gpt-test");
-			expect(text).toContain("Effort high");
-			expect(text).toContain("API換算 ≈$0.1250");
+			expect(text).toContain("gpt-test / high / API換算 ≈$0.13");
+			expect(text).not.toContain("Effort");
+			expect(text).toContain("API換算 ≈$0.13");
 			expect(text).toContain("12.3%");
 			expect(text).toContain("█");
+		}
+	});
+
+	it.each([
+		[0.1234, "0.12"],
+		[0.125, "0.13"],
+		[0.126, "0.13"],
+		[0.145, "0.15"],
+		[1.005, "1.01"],
+		[1.015, "1.02"],
+		[2.675, "2.68"],
+	])("rounds API-equivalent cost %s to $%s without changing its source", (total, expected) => {
+		const usage = { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total } };
+		const session = createSession({ sessionName: "", usage });
+		const text = stripAnsi(new FooterComponent(session, createFooterData(1)).render(120)[0]);
+		expect(text).toContain(`API換算 ≈$${expected}`);
+		expect(usage.cost.total).toBe(total);
+	});
+
+	it("uses slash separators for footer fields, session name, and the experimental marker", () => {
+		const previousExperimental = process.env.PI_EXPERIMENTAL;
+		process.env.PI_EXPERIMENTAL = "1";
+		try {
+			const session = createSession({
+				sessionName: "named-session",
+				usage: {
+					input: 10,
+					output: 2,
+					cacheRead: 0,
+					cacheWrite: 0,
+					cost: { total: 0.5 },
+				},
+			});
+			const footer = new FooterComponent(session, createFooterData(1));
+			const lines = footer.render(120).map(stripAnsi);
+			const statsLine = lines[1] ?? "";
+
+			expect(lines[0]).toContain("test-model / off / API換算 ≈$0.50");
+			expect(lines[0]).not.toContain("Effort");
+			expect(statsLine).toBe("↑10 / ↓2 / xp");
+			expect(statsLine).not.toContain("•");
+			expect(lines.at(-1)).toMatch(/\(main\) \/ named-session$/u);
+		} finally {
+			if (previousExperimental === undefined) delete process.env.PI_EXPERIMENTAL;
+			else process.env.PI_EXPERIMENTAL = previousExperimental;
 		}
 	});
 
@@ -289,7 +335,7 @@ describe("FooterComponent width handling", () => {
 		const footer = new FooterComponent(session, createFooterData(1));
 		const stats = stripAnsi(footer.render(120)[0]);
 
-		expect(stats).toContain("API換算 ≈$1.2340");
+		expect(stats).toContain("API換算 ≈$1.23");
 		expect(stats).not.toContain("(sub)");
 	});
 
@@ -298,7 +344,7 @@ describe("FooterComponent width handling", () => {
 		const footer = new FooterComponent(session, createFooterData(1));
 		const stats = stripAnsi(footer.render(120)[0]);
 
-		expect(stats).toContain("API換算 ≈$0.0000");
+		expect(stats).toContain("API換算 ≈$0.00");
 		expect(stats).not.toContain("(sub)");
 	});
 
@@ -317,7 +363,7 @@ describe("FooterComponent width handling", () => {
 		const footer = new FooterComponent(session, createFooterData(1));
 		const stats = stripAnsi(footer.render(120)[0]);
 
-		expect(stats).toContain("API換算 ≈$1.2340");
+		expect(stats).toContain("API換算 ≈$1.23");
 		expect(stats).not.toContain("(sub)");
 	});
 });

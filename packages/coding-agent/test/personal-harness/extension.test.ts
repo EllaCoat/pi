@@ -10,10 +10,12 @@ import {
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
+import { type Component, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI } from "../../src/core/extensions/types.ts";
+import type { ExtensionAPI, ExtensionUIContext } from "../../src/core/extensions/types.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
+import type { Theme } from "../../src/modes/interactive/theme/theme.ts";
 import {
 	HARNESS_CHILD_RESULT_ENTRY,
 	HARNESS_CHILD_USAGE_ENTRY,
@@ -31,6 +33,7 @@ import { type MemoryExcerpt, PersonalMemoryStore } from "../../src/personal-harn
 import * as modelCalls from "../../src/personal-harness/model-call.ts";
 import { TODO_SESSION_ENTRY_TYPE } from "../../src/personal-harness/todo/index.ts";
 import type { HarnessUsageLedger } from "../../src/personal-harness/usage.ts";
+import { stripAnsi } from "../../src/utils/ansi.ts";
 import { createHarness, getMessageText, type Harness } from "../suite/harness.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
 
@@ -1021,6 +1024,89 @@ describe("personal harness extension in an AgentSession", () => {
 			items: [{ title: "Manual progress fixture", status: "done" }],
 			progress: { done: 1, total: 1, inProgress: [] },
 		});
+	});
+
+	it("renders TODO text without widget padding, preserves its marker, and keeps placement", async () => {
+		type TodoWidgetFactory = (tui: TUI, theme: Theme) => Component & { dispose?(): void };
+		let extensionApi: ExtensionAPI | undefined;
+		const widgets: Array<{ factory: TodoWidgetFactory; placement?: string }> = [];
+		const setWidget = vi.fn(
+			(
+				key: string,
+				content: string[] | TodoWidgetFactory | undefined,
+				options?: { placement?: "aboveEditor" | "belowEditor" },
+			) => {
+				if (key === "personal-harness-todo" && typeof content === "function") {
+					widgets.push({ factory: content, placement: options?.placement });
+				}
+			},
+		);
+		const harness = await create(dataDirectory(), {
+			extensionFactories: [
+				(pi) => {
+					extensionApi = pi;
+				},
+			],
+		});
+		await harness.session.bindExtensions({
+			mode: "tui",
+			uiContext: { setWidget } as unknown as ExtensionUIContext,
+		});
+
+		// The factory only reads fg for its overflow marker; Text rendering does not use TUI.
+		const widgetTui = {} as TUI;
+		const widgetTheme = { fg: (_color: string, text: string) => text } as Theme;
+		const renderLatestWidget = (width: number): string[] => {
+			const widget = widgets.at(-1);
+			if (!widget) throw new Error("TODO widget factory was not registered");
+			return widget
+				.factory(widgetTui, widgetTheme)
+				.render(width)
+				.map((line) => stripAnsi(line).trimEnd());
+		};
+		expect(renderLatestWidget(80)).toEqual(["TODO / 0/0 done / 0 in progress"]);
+		expect(widgets.at(-1)?.placement).toBe("belowEditor");
+
+		if (!extensionApi) throw new Error("Extension API was not initialized");
+		const added = await extensionApi.executeTool(
+			"todo",
+			{ action: "add", title: "Keep the TODO item prefix" },
+			{ assistantMessage: fauxAssistantMessage("Add a TODO item") },
+		);
+		const addedText = added.content.find((part) => part.type === "text")?.text;
+		if (!addedText) throw new Error("TODO add returned no text result");
+		const parsedAdded: unknown = JSON.parse(addedText);
+		if (!isRecord(parsedAdded) || !Array.isArray(parsedAdded.items))
+			throw new Error("TODO add returned an invalid result");
+		const addedItems: unknown[] = parsedAdded.items;
+		const firstItem = addedItems[0];
+		if (!isRecord(firstItem) || typeof firstItem.id !== "string") throw new Error("TODO add returned no item ID");
+		const itemId = firstItem.id;
+		await extensionApi.executeTool(
+			"todo",
+			{ action: "status", id: itemId, status: "in_progress" },
+			{ assistantMessage: fauxAssistantMessage("Mark the TODO in progress") },
+		);
+
+		expect(renderLatestWidget(80)).toEqual(["TODO / 0/1 done / 1 in progress", "[>] Keep the TODO item prefix"]);
+		for (const width of [16, 40]) {
+			const lines = renderLatestWidget(width);
+			expect(lines[0]).toMatch(/^TODO/u);
+			expect(lines).not.toContain("");
+			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+
+		for (let index = 0; index < 10; index++) {
+			await extensionApi.executeTool(
+				"todo",
+				{ action: "add", title: `Additional TODO ${index + 1}` },
+				{ assistantMessage: fauxAssistantMessage("Add another TODO item") },
+			);
+		}
+		const truncatedLines = renderLatestWidget(80);
+		expect(truncatedLines).toHaveLength(11);
+		expect(truncatedLines[0]).toBe("TODO / 0/11 done / 1 in progress");
+		expect(truncatedLines.at(-1)).toBe("... (widget truncated)");
 	});
 
 	it("uses Luna high with Fast Mode and accepts a reasonable background completion", async () => {

@@ -9,6 +9,12 @@ import { sessionApiEquivalentCost } from "../../../personal-harness/api-equivale
 import { theme } from "../theme/theme.ts";
 import { formatOpenAIUsage } from "./openai-usage.ts";
 
+const apiCostFormatter = new Intl.NumberFormat("en-US", {
+	minimumFractionDigits: 2,
+	maximumFractionDigits: 2,
+	useGrouping: false,
+});
+
 /**
  * Sanitize text for display in a single-line status.
  * Removes newlines, tabs, carriage returns, and other control characters.
@@ -135,7 +141,7 @@ export class FooterComponent implements Component {
 		const branch = this.footerData.getGitBranch();
 		if (branch) pwd = `${pwd} (${branch})`;
 		const sessionName = this.session.sessionManager.getSessionName();
-		if (sessionName) pwd = `${pwd} • ${sessionName}`;
+		if (sessionName) pwd = `${pwd} / ${sessionName}`;
 
 		const modelName = sanitizeStatusText(state.model?.id || "no-model");
 		const modelDisplay =
@@ -145,7 +151,7 @@ export class FooterComponent implements Component {
 		const effort = sanitizeStatusText(state.thinkingLevel || "off");
 		const cost = sessionApiEquivalentCost(entries);
 		const unknownCost = cost.unknownCalls > 0 ? "+?" : "";
-		const primaryLeft = `${modelDisplay} • Effort ${effort} • API換算 ≈$${cost.estimatedUsd.toFixed(4)}${unknownCost}`;
+		const primaryLeft = `${modelDisplay} / ${effort} / API換算 ≈$${apiCostFormatter.format(cost.estimatedUsd)}${unknownCost}`;
 		const primaryRows =
 			visibleWidth(primaryLeft) + 2 + visibleWidth(contextRow) <= displayWidth
 				? [
@@ -166,10 +172,9 @@ export class FooterComponent implements Component {
 		if ((usageTotals.cacheRead > 0 || usageTotals.cacheWrite > 0) && latestCacheHitRate !== undefined) {
 			statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
 		}
-		if (areExperimentalFeaturesEnabled())
-			statsParts.push(`${theme.fg("dim", "•")} ${theme.bold(theme.fg("warning", "xp"))}`);
+		if (areExperimentalFeaturesEnabled()) statsParts.push(theme.bold(theme.fg("warning", "xp")));
 		if (statsParts.length > 0) {
-			lines.push(...wrapTextWithAnsi(statsParts.join(" "), displayWidth).map((line) => theme.fg("dim", line)));
+			lines.push(...wrapTextWithAnsi(statsParts.join(" / "), displayWidth).map((line) => theme.fg("dim", line)));
 		}
 
 		lines.push(truncateToWidth(theme.fg("dim", pwd), displayWidth, theme.fg("dim", "...")));
