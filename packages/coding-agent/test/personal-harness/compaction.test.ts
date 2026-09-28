@@ -178,6 +178,37 @@ describe("Sol/high+Fast compaction hook in AgentSession", () => {
 		expect(fixture.harness.getPendingResponseCount()).toBe(1);
 	});
 
+	it("runs the dedicated hook when configured context usage reaches thresholdPercent", async () => {
+		vi.mocked(runCompactionSession).mockResolvedValueOnce({ summary: "threshold checkpoint" });
+		const fixture = await setupSession();
+		fixture.harness.settingsManager.applyOverrides({
+			compaction: { reserveTokens: 10_000, thresholdPercent: 50 },
+		});
+		const model = fixture.harness.getModel();
+		const usedTokens = Math.ceil(model.contextWindow / 2);
+		const sessionInternals = fixture.harness.session as unknown as {
+			_checkCompaction: (assistantMessage: AssistantMessage) => Promise<boolean>;
+		};
+
+		await sessionInternals._checkCompaction({
+			...response,
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			timestamp: Date.now(),
+			usage: { ...response.usage, input: usedTokens, output: 0, totalTokens: usedTokens },
+		});
+
+		expect(vi.mocked(runCompactionSession)).toHaveBeenCalledTimes(1);
+		expect(fixture.harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "threshold",
+			willRetry: false,
+		});
+		expect(fixture.harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(
+			1,
+		);
+	});
+
 	it("cancels a failed dedicated compact without default fallback or history changes", async () => {
 		vi.mocked(runCompactionSession).mockRejectedValueOnce(new Error("provider detail"));
 		const fixture = await setupSession();

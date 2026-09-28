@@ -1013,4 +1013,32 @@ describe("AgentSession compaction characterization", () => {
 		expect(belowThresholdSpy).not.toHaveBeenCalled();
 		expect(disabledSpy).not.toHaveBeenCalled();
 	});
+
+	it("applies the configured percentage before automatic compaction hooks", async () => {
+		const reasons: string[] = [];
+		const harness = await createHarness({
+			settings: {
+				compaction: { reserveTokens: 10_000, keepRecentTokens: 1, thresholdPercent: 50 },
+			},
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", (event) => {
+						reasons.push(event.reason);
+						return { cancel: true };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		await sessionInternals._checkCompaction(
+			createAssistant(harness, { stopReason: "stop", totalTokens: 100_000, timestamp: Date.now() }),
+		);
+
+		expect(reasons).toEqual(["threshold"]);
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
+	});
 });

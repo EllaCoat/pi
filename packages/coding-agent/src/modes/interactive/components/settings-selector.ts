@@ -27,6 +27,8 @@ import { keyDisplayText } from "./keybinding-hints.ts";
 import { SelectSubmenu, SteppedSubmenu, type SteppedSubmenuStep } from "./settings-submenu.ts";
 
 const MODEL_PICKER_LAYOUT = { minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 46 };
+const DEFAULT_COMPACTION_THRESHOLD_VALUE = "Default";
+const COMPACTION_THRESHOLD_OPTIONS = [50, 60, 70, 80, 85, 90, 95, 100];
 
 const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
@@ -50,6 +52,7 @@ const DEFAULT_PROJECT_TRUST_BY_LABEL = new Map(
 
 export interface SettingsConfig {
 	autoCompact: boolean;
+	autoCompactThresholdPercent: number | undefined;
 	defaultModel: string;
 	currentModel?: Model<any>;
 	availableDefaultModels: readonly Model<any>[];
@@ -93,6 +96,7 @@ export interface SettingsConfig {
 
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
+	onCompactionThresholdPercentChange: (thresholdPercent: number | undefined) => number | undefined;
 	onShowImagesChange: (enabled: boolean) => void;
 	onImageWidthCellsChange: (width: number) => void;
 	onAutoResizeImagesChange: (enabled: boolean) => void;
@@ -470,6 +474,24 @@ export class SettingsSelectorComponent extends Container {
 				values: ["true", "false"],
 			},
 			{
+				id: "compaction-threshold",
+				label: "Auto-compact threshold",
+				description:
+					"Set the global preference; project settings take priority. Compact at this percentage or the reserveTokens limit, whichever comes first. Default uses reserveTokens.",
+				currentValue:
+					config.autoCompactThresholdPercent === undefined
+						? DEFAULT_COMPACTION_THRESHOLD_VALUE
+						: `${config.autoCompactThresholdPercent}%`,
+				values: [
+					DEFAULT_COMPACTION_THRESHOLD_VALUE,
+					...COMPACTION_THRESHOLD_OPTIONS.map((percent) => `${percent}%`),
+					...(config.autoCompactThresholdPercent !== undefined &&
+					!COMPACTION_THRESHOLD_OPTIONS.includes(config.autoCompactThresholdPercent)
+						? [`${config.autoCompactThresholdPercent}%`]
+						: []),
+				],
+			},
+			{
 				id: "steering-mode",
 				label: "Steering mode",
 				description:
@@ -844,6 +866,16 @@ export class SettingsSelectorComponent extends Container {
 					case "autocompact":
 						callbacks.onAutoCompactChange(newValue === "true");
 						break;
+					case "compaction-threshold": {
+						const effective = callbacks.onCompactionThresholdPercentChange(
+							newValue === DEFAULT_COMPACTION_THRESHOLD_VALUE ? undefined : Number.parseInt(newValue, 10),
+						);
+						this.settingsList.updateValue(
+							id,
+							effective === undefined ? DEFAULT_COMPACTION_THRESHOLD_VALUE : `${effective}%`,
+						);
+						break;
+					}
 					case "show-images":
 						callbacks.onShowImagesChange(newValue === "true");
 						break;

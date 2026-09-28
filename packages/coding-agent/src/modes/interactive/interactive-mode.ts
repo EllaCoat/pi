@@ -4782,6 +4782,7 @@ export class InteractiveMode {
 			selector = new SettingsSelectorComponent(
 				{
 					autoCompact: this.session.autoCompactionEnabled,
+					autoCompactThresholdPercent: this.settingsManager.getCompactionThresholdPercent(),
 					defaultModel,
 					currentModel: this.session.model,
 					availableDefaultModels: this.session.modelRuntime.getAvailableSnapshot(),
@@ -4826,6 +4827,16 @@ export class InteractiveMode {
 					onAutoCompactChange: (enabled) => {
 						this.session.setAutoCompactionEnabled(enabled);
 						this.footer.setAutoCompactEnabled(enabled);
+					},
+					onCompactionThresholdPercentChange: (thresholdPercent) => {
+						this.settingsManager.setCompactionThresholdPercent(thresholdPercent);
+						const effective = this.settingsManager.getCompactionThresholdPercent();
+						if (effective !== thresholdPercent) {
+							this.showWarning(
+								"Global compaction preference saved, but the project setting takes priority. Showing the effective threshold.",
+							);
+						}
+						return effective;
 					},
 					onShowImagesChange: (enabled) => {
 						this.settingsManager.setShowImages(enabled);

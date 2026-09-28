@@ -7,6 +7,7 @@ import {
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	findCutPoint,
+	getCompactionThresholdTokens,
 	getLastAssistantUsage,
 	prepareCompaction,
 	shouldCompact,
@@ -280,6 +281,26 @@ describe("shouldCompact", () => {
 
 		expect(shouldCompact(95000, 100000, settings)).toBe(true);
 		expect(shouldCompact(89000, 100000, settings)).toBe(false);
+	});
+	it("uses the earlier of the configured percentage and reserve-token boundaries", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10_000,
+			keepRecentTokens: 20_000,
+			thresholdPercent: 80,
+		};
+		expect(getCompactionThresholdTokens(100_000, settings)).toBe(79_999);
+		expect(shouldCompact(79_999, 100_000, settings)).toBe(false);
+		expect(shouldCompact(80_000, 100_000, settings)).toBe(true);
+
+		const laterPercentage = { ...settings, thresholdPercent: 95 };
+		expect(getCompactionThresholdTokens(100_000, laterPercentage)).toBe(90_000);
+		expect(shouldCompact(90_000, 100_000, laterPercentage)).toBe(false);
+		expect(shouldCompact(90_001, 100_000, laterPercentage)).toBe(true);
+
+		const legacy: CompactionSettings = { enabled: true, reserveTokens: 10_000, keepRecentTokens: 20_000 };
+		expect(shouldCompact(90_000, 100_000, legacy)).toBe(false);
+		expect(shouldCompact(90_001, 100_000, legacy)).toBe(true);
 	});
 
 	it("should return false when disabled", () => {

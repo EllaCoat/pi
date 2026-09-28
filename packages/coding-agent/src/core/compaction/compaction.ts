@@ -143,6 +143,7 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	thresholdPercent?: number;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
@@ -283,12 +284,17 @@ export function estimateProjectedContextTokens(
 	return { tokens, usageTokens: 0, trailingTokens: tokens, lastUsageIndex: null };
 }
 
-/**
- * Check if compaction should trigger based on context usage.
- */
+/** Highest integer context usage that does not trigger either threshold. */
+export function getCompactionThresholdTokens(contextWindow: number, settings: CompactionSettings): number {
+	const reserveThreshold = contextWindow - settings.reserveTokens;
+	if (settings.thresholdPercent === undefined) return reserveThreshold;
+	return Math.min(reserveThreshold, Math.ceil((contextWindow * settings.thresholdPercent) / 100) - 1);
+}
+
+/** Check if compaction should trigger based on context usage. */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	return contextTokens > getCompactionThresholdTokens(contextWindow, settings);
 }
 
 // ============================================================================
