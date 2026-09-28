@@ -84,7 +84,7 @@ describe("personal harness Pi profile", () => {
 		expect(session._expandSkillCommand("/skill:fixture-skill")).toContain("Lazily expanded fixture body.");
 	});
 
-	it("maps OMP host and MCP call notation in the profile extension without exposing endpoint details", async () => {
+	it("describes active tool usage contracts in the profile extension without exposing endpoint details", async () => {
 		workDir = mkdtempSync(join(tmpdir(), "pi-profile-tools-"));
 		const skillsRoot = join(workDir, "omp-skills");
 		createSkill(skillsRoot, "fixture-skill", "Fixture body.");
@@ -132,12 +132,27 @@ describe("personal harness Pi profile", () => {
 		).toContain("Fixture body.");
 		expect(systemPrompt).toContain("await tool.NAME(args)");
 		expect(Object.keys(leadingSections)).toEqual(["code_mode_tools", "personal_harness"]);
-		expect(leadingSections.personal_harness).toContain("Personal OMP profile tool mapping:");
+		expect(leadingSections.personal_harness).toContain("## Axia-Pi tool usage");
 		expect(systemPrompt.indexOf("<code_mode_tools>")).toBeLessThan(systemPrompt.indexOf("<personal_harness>"));
 		expect(forceSystemPrompt).toBeUndefined();
-		expect(systemPrompt).toContain('await tool.mcp({action: "call"');
-		expect(systemPrompt).toContain('Configured aliases: ["jev"]');
-		expect(systemPrompt).toContain("await tool.skill_read({uri:");
+		expect(systemPrompt).toContain('MCP uses tool.mcp with action "discover" or "call"');
+		expect(systemPrompt).toContain('Configured MCP aliases: ["jev"].');
+		expect(systemPrompt).toContain("tool.skill_read({uri})");
 		expect(systemPrompt).toContain("not an OS sandbox");
+		expect(leadingSections.code_mode_tools).toContain("- JavaScript uses a Node-compatible REPL.");
+		expect(leadingSections.code_mode_tools).toContain(
+			"- Tool selection is not user approval, and existing approval still applies.",
+		);
+		expect(leadingSections.code_mode_tools).toContain("- Do not call tool.eval recursively.");
+		expect(leadingSections.code_mode_tools).not.toContain("OMP");
+		expect(leadingSections.personal_harness).toContain("Use the active tool catalog.");
+		expect(leadingSections.personal_harness).toContain(
+			"Neither is the handwritten notes store; use returned source references rather than inventing IDs.",
+		);
+		expect(leadingSections.personal_harness).toContain(
+			"Do not add a Goal-start approval to ordinary requested work.",
+		);
+		expect(leadingSections.personal_harness).toContain("A web search is not browser interaction");
+		expect(leadingSections.personal_harness).not.toContain("OMP");
 	});
 });

@@ -101,6 +101,24 @@ describe("personal harness extension in an AgentSession", () => {
 		for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
 	});
 
+	it("describes the recall, memory, notes, and TODO tool contracts", async () => {
+		const harness = await create(dataDirectory());
+		const tools = Object.fromEntries(harness.session.getAllTools().map((tool) => [tool.name, tool]));
+
+		expect(tools.recall?.description).toBe(
+			"- Recall from the private session-derived memory index and return cited material.\n- Searches across indexed sessions unless sessionId or branchId narrows the query.\n- This does not search or write handwritten shared notes.",
+		);
+		expect(tools.memory?.description).toBe(
+			"- Search or read private session-derived memory, or manage a cited record in its index. search returns indexed matches; recall may curate them.\n- Use returned references for read/correct/exclude/include.\n- These updates are not shared-note writes.",
+		);
+		expect(tools.notes?.description).toBe(
+			"- Search or read explicitly configured handwritten Markdown notes.\n- There is no write action.\n- An unconfigured root returns unavailable, not an empty search result; do not guess another root.",
+		);
+		expect(tools.todo?.description).toBe(
+			"- Read or edit the lightweight session TODO list with action list/add/edit/status/remove/retry.\n- Use returned item IDs for edits. retry only retries saving the list, not executing a task or calling the updater model.\n- TODO status is a working progress note, not Goal completion or product acceptance.",
+		);
+	});
+
 	it("marks direct and Code Mode web-search failures as tool errors", async () => {
 		const harness = await create(
 			dataDirectory(),
@@ -715,7 +733,7 @@ describe("personal harness extension in an AgentSession", () => {
 			expect(memoryRequest?.context.systemPrompt).toContain("Preserve ordinary project identifiers");
 			expect(memoryRequest?.context.systemPrompt).toContain("failed or unverified outcomes");
 			expect(memoryRequest?.context.systemPrompt).toContain("Do not repeat actual credential or secret values");
-			expect(memoryRequest?.context.systemPrompt).not.toContain("Personal OMP profile tool mapping");
+			expect(memoryRequest?.context.systemPrompt).not.toContain("## Axia-Pi tool usage");
 			expect(memoryRequest?.context.tools?.map((tool) => tool.name)).toEqual(["return_memory_curate"]);
 			const curatorMessage = memoryRequest?.context.messages[0];
 			if (!curatorMessage || curatorMessage.role !== "user" || typeof curatorMessage.content !== "string") {
@@ -1229,6 +1247,9 @@ describe("personal harness extension in an AgentSession", () => {
 		expect(requests[0].evalDescription).toContain('tool.tool_info({name: "NAME"})');
 		expect(requests[0].names.sort()).toEqual(["ask", "eval", "todo"]);
 		expect(requests[0].system).toContain("LEGACY_APPEND_MARKER");
+		expect(requests[0].system).toContain(
+			"- View or update session TODO items; use returned IDs and reserve retry for failed persistence.",
+		);
 		for (const prompt of legacyPromptViews) {
 			expect(prompt).not.toContain("HIDDEN_SNIPPET_SENTINEL");
 			expect(prompt).not.toContain("HIDDEN_GUIDELINE_SENTINEL");

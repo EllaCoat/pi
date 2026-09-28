@@ -124,7 +124,8 @@ function codeTool(sessionId: string, codeMode: CodeModeSessionManager, cwd: stri
 		label: "personal eval",
 		description:
 			"Run persistent JavaScript or Python. Use tool.<name>(args) only for this child's selected host tools; use tool.message_parent({text, waitForReply?}) to report a finding or ask the parent, and tool.tool_info({}) to inspect permitted host tools.",
-		promptSnippet: "Run persistent code with the isolated child kernel and approved host tools.",
+		promptSnippet:
+			"- Run persistent code in the child's separate kernel with its selected host tools; tool selection is not user approval.",
 		parameters: CHILD_EVAL_PARAMETERS,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		execute: async (_toolCallId, params, signal) => {
@@ -387,7 +388,7 @@ export function createPiSubagentSessionFactory(
 			settingsManager,
 			systemPrompt: options.systemPrompt,
 			appendSystemPrompt: [
-				"You are a subagent with an explicitly delegated task. Keep inherited approval boundaries. Do not start Goals or delegate again. Report verified results and remaining uncertainty to the parent.",
+				"- You are a subagent with an explicitly delegated task.\n- Keep inherited approval boundaries.\n- Do not start Goals or delegate again.\n- Report findings, changes, relevant checks, and uncertainty to the parent.\n- Match verification to your assignment: changed behavior needs checks, while read-only findings need source evidence rather than unrelated test suites.",
 			],
 			noExtensions: true,
 			noSkills: true,

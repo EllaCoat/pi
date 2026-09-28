@@ -1500,7 +1500,8 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		pi.registerTool({
 			name: "recall",
 			label: "personal recall",
-			description: "Search the private session-derived memory index and return cited excerpts for this query.",
+			description:
+				"- Recall from the private session-derived memory index and return cited material.\n- Searches across indexed sessions unless sessionId or branchId narrows the query.\n- This does not search or write handwritten shared notes.",
 			promptSnippet: "Recall related prior session records with citations.",
 			parameters: RecallParameters,
 			constrainedSampling: { type: "json_schema", strict: "prefer" },
@@ -1515,7 +1516,8 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		pi.registerTool({
 			name: "memory",
 			label: "personal memory",
-			description: "Search, read, correct, exclude, or restore a cited private memory source.",
+			description:
+				"- Search or read private session-derived memory, or manage a cited record in its index. search returns indexed matches; recall may curate them.\n- Use returned references for read/correct/exclude/include.\n- These updates are not shared-note writes.",
 			promptSnippet: "Manage a cited memory source; changes stay in the private SQLite index.",
 			parameters: MemoryParameters,
 			constrainedSampling: { type: "json_schema", strict: "prefer" },
@@ -1530,7 +1532,8 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		pi.registerTool({
 			name: "notes",
 			label: "shared notes",
-			description: "Search or read explicitly configured Markdown notes; the notes root is never guessed.",
+			description:
+				"- Search or read explicitly configured handwritten Markdown notes.\n- There is no write action.\n- An unconfigured root returns unavailable, not an empty search result; do not guess another root.",
 			promptSnippet: "Search notes by query and optional scope, or read one returned note ID.",
 			parameters: NotesParameters,
 			constrainedSampling: { type: "json_schema", strict: "prefer" },
@@ -1569,8 +1572,10 @@ export function createPersonalHarnessExtension(options: PersonalHarnessExtension
 		pi.registerTool({
 			name: "todo",
 			label: "personal todo",
-			description: "Read or edit the lightweight session TODO list.",
-			promptSnippet: "View or edit the lightweight session TODO list.",
+			description:
+				"- Read or edit the lightweight session TODO list with action list/add/edit/status/remove/retry.\n- Use returned item IDs for edits. retry only retries saving the list, not executing a task or calling the updater model.\n- TODO status is a working progress note, not Goal completion or product acceptance.",
+			promptSnippet:
+				"- View or update session TODO items; use returned IDs and reserve retry for failed persistence.",
 			parameters: TodoParameters,
 			constrainedSampling: { type: "json_schema", strict: "prefer" },
 			execute: async (_id, params, _signal, _update, context) => {
