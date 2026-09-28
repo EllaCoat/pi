@@ -26,13 +26,18 @@ Both use closely related structured formats and track file operations cumulative
 
 ### When It Triggers
 
-Auto-compaction triggers when:
+Auto-compaction uses the existing reserve-token limit unless `compaction.thresholdPercent` is set:
 
 ```
 contextTokens > contextWindow - reserveTokens
 ```
 
-By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). This leaves room for the LLM's response.
+With an explicit percentage, compaction starts at whichever boundary is reached first:
+
+- `contextTokens >= ceil(contextWindow * thresholdPercent / 100)`
+- `contextTokens > contextWindow - reserveTokens`
+
+The first condition fires at the configured percentage of the selected model's context window; the second preserves the existing response reserve. Leaving `thresholdPercent` unset preserves the former `reserveTokens` behavior exactly. `reserveTokens` defaults to 16384 tokens and is configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`.
 
 During a multi-turn agent run, Pi checks the canonical projected context after tools finish and their results are appended, before starting the next assistant response. If the threshold is crossed, Pi compacts during `prepareNextTurn`, then performs the existing catch-up steering poll before `turn_start`. It skips this between-turn check when the completed tool batch terminates the run and no queued message requires another response. Pi also checks before a new user prompt and performs final-attempt overflow recovery after the low-level run ends.
 
@@ -423,6 +428,7 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
+    "thresholdPercent": 75,
     "keepRecentTokens": 20000
   }
 }
@@ -432,9 +438,12 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 |---------|---------|-------------|
 | `enabled` | `true` | Enable auto-compaction |
 | `reserveTokens` | `16384` | Tokens to reserve for LLM response |
+| `thresholdPercent` | Unset | Trigger at this percentage of the selected model's context window (integer from 1 to 100); the earlier of this threshold and the `reserveTokens` boundary wins. |
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.
+
+Use `/settings` → **Auto-compact threshold** to change the user-wide preference. Project settings take precedence; the selector shows the effective value and warns when the project setting overrides the selection.
 
 ### Per-model overrides
 
@@ -454,10 +463,10 @@ Use `compaction.modelOverrides` to tune token budgets for different models:
 }
 ```
 
-For a model with a 1M context window, this override triggers compaction above 600K tokens and keeps the ordinary 20000 recent tokens. Other models retain the ordinary 16384-token reserve. `reserveTokens` also influences summarization output limits, capped by the model's maximum output tokens; it is not solely a trigger threshold.
+For a model with a 1M context window, the per-model `reserveTokens` override of 400000 triggers compaction above 600K tokens and keeps the ordinary 20000 recent tokens. Other models retain the ordinary 16384-token reserve. `reserveTokens` also influences summarization output limits, capped by the model's maximum output tokens; it is not solely a trigger threshold.
 
-Keys are exact, case-sensitive `provider/modelId` values, including any slashes within the model ID. Each `reserveTokens` and `keepRecentTokens` value falls back independently from the model override to the ordinary setting to the built-in default. Values must be non-negative safe integers. Invalid values in the matching model override produce an error when read; only omitted fields fall back to the ordinary setting. Model override entries must be objects. Invalid ordinary token settings produce an error when read, even if the active model has a valid override. Only omitted ordinary values use built-in defaults. `enabled` remains global, not model-specific.
+`modelOverrides` accepts only `reserveTokens` and `keepRecentTokens`; `thresholdPercent` is an ordinary global/project setting shared by models and is evaluated against each selected model's context window.
 
-These resolved values are used for manual compaction, all automatic threshold checks, overflow recovery, and extension-visible `preparation.settings`. Model switches affect subsequent checks and compactions without changing ordinary settings. Compaction already in progress uses the model and settings captured for that operation. Branch summarization settings are unaffected.
+`reserveTokens` and `keepRecentTokens` settings are resolved and used for manual compaction, automatic threshold checks, overflow recovery, and extension-visible `preparation.settings`. `thresholdPercent` affects only automatic threshold checks. Model switches affect subsequent checks and compactions without changing ordinary settings. Compaction already in progress uses the model and settings captured for that operation. Branch summarization settings are unaffected.
 
 Overrides work in both global and project settings. The files merge recursively before lookup, so a global model-specific value beats a project-wide fallback; a project must override that model entry to change it. See [Settings](settings.md#per-model-compaction-overrides) for details.

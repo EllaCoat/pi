@@ -23,6 +23,7 @@ import {
 	type ModelThinkingLevel,
 	type Usage,
 } from "@earendil-works/pi-ai";
+import { getCompactionThresholdTokens } from "../../core/compaction/index.ts";
 import { findInitialModel } from "../../core/model-resolver.ts";
 import { ModelRuntime } from "../../core/model-runtime.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
@@ -79,7 +80,7 @@ export async function openMicro(options: OpenMicroOptions = {}): Promise<OpenMic
 		const compaction = initial?.model ? settings.getCompactionSettings(initial.model) : undefined;
 		const threshold =
 			initial?.model && compaction?.enabled
-				? Math.max(0, initial.model.contextWindow - compaction.reserveTokens)
+				? Math.max(0, getCompactionThresholdTokens(initial.model.contextWindow, compaction))
 				: 0;
 
 		storage = await JsonlStorage.open(location.path);
@@ -109,9 +110,24 @@ export async function openMicro(options: OpenMicroOptions = {}): Promise<OpenMic
 		);
 		const root = await harness.root(BACKGROUND_CONTEXT);
 		const config = await root.config.get(BACKGROUND_CONTEXT);
+		const configUpdate: { selectedTools?: string[]; threshold?: number; keepRecent?: number } = {};
 		if (JSON.stringify(config.selectedTools) !== JSON.stringify(selectedTools)) {
-			await root.config.set({ selectedTools }, BACKGROUND_CONTEXT);
+			configUpdate.selectedTools = selectedTools;
 		}
+		if (!location.created) {
+			const savedModel = modelRef(config.model);
+			const model = savedModel ? modelRuntime.getModel(savedModel.provider, savedModel.modelId) : undefined;
+			if (model) {
+				const compaction = settings.getCompactionSettings(model);
+				const threshold = compaction.enabled
+					? Math.max(0, getCompactionThresholdTokens(model.contextWindow, compaction))
+					: 0;
+				if (config.threshold !== threshold) configUpdate.threshold = threshold;
+				if (config.keepRecent !== compaction.keepRecentTokens)
+					configUpdate.keepRecent = compaction.keepRecentTokens;
+			}
+		}
+		if (Object.keys(configUpdate).length > 0) await root.config.set(configUpdate, BACKGROUND_CONTEXT);
 
 		const namespace = harness.namespace("micro.system", {});
 		harness.hooks(namespace, kinds.generation, {
@@ -321,7 +337,9 @@ export async function openMicro(options: OpenMicroOptions = {}): Promise<OpenMic
 						{
 							model: ref,
 							thinkingLevel: clampThinkingLevel(model, currentThinking),
-							threshold: compact.enabled ? Math.max(0, model.contextWindow - compact.reserveTokens) : 0,
+							threshold: compact.enabled
+								? Math.max(0, getCompactionThresholdTokens(model.contextWindow, compact))
+								: 0,
 							keepRecent: compact.keepRecentTokens,
 						},
 						BACKGROUND_CONTEXT,

@@ -10,10 +10,12 @@ import {
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
+import { type Component, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI } from "../../src/core/extensions/types.ts";
+import type { ExtensionAPI, ExtensionUIContext } from "../../src/core/extensions/types.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
+import type { Theme } from "../../src/modes/interactive/theme/theme.ts";
 import {
 	HARNESS_CHILD_RESULT_ENTRY,
 	HARNESS_CHILD_USAGE_ENTRY,
@@ -31,6 +33,7 @@ import { type MemoryExcerpt, PersonalMemoryStore } from "../../src/personal-harn
 import * as modelCalls from "../../src/personal-harness/model-call.ts";
 import { TODO_SESSION_ENTRY_TYPE } from "../../src/personal-harness/todo/index.ts";
 import type { HarnessUsageLedger } from "../../src/personal-harness/usage.ts";
+import { stripAnsi } from "../../src/utils/ansi.ts";
 import { createHarness, getMessageText, type Harness } from "../suite/harness.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
 
@@ -96,6 +99,24 @@ describe("personal harness extension in an AgentSession", () => {
 			harness.cleanup();
 		}
 		for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
+	});
+
+	it("describes the recall, memory, notes, and TODO tool contracts", async () => {
+		const harness = await create(dataDirectory());
+		const tools = Object.fromEntries(harness.session.getAllTools().map((tool) => [tool.name, tool]));
+
+		expect(tools.recall?.description).toBe(
+			"- Recall from the private session-derived memory index and return cited material.\n- Searches across indexed sessions unless sessionId or branchId narrows the query.\n- This does not search or write handwritten shared notes.",
+		);
+		expect(tools.memory?.description).toBe(
+			"- Search or read private session-derived memory, or manage a cited record in its index. search returns indexed matches; recall may curate them.\n- Use returned references for read/correct/exclude/include.\n- These updates are not shared-note writes.",
+		);
+		expect(tools.notes?.description).toBe(
+			"- Search or read explicitly configured handwritten Markdown notes.\n- There is no write action.\n- An unconfigured root returns unavailable, not an empty search result; do not guess another root.",
+		);
+		expect(tools.todo?.description).toBe(
+			"- Read or edit the lightweight session TODO list with action list/add/edit/status/remove/retry.\n- Use returned item IDs for edits. retry only retries saving the list, not executing a task or calling the updater model.\n- TODO status is a working progress note, not Goal completion or product acceptance.",
+		);
 	});
 
 	it("marks direct and Code Mode web-search failures as tool errors", async () => {
@@ -712,7 +733,7 @@ describe("personal harness extension in an AgentSession", () => {
 			expect(memoryRequest?.context.systemPrompt).toContain("Preserve ordinary project identifiers");
 			expect(memoryRequest?.context.systemPrompt).toContain("failed or unverified outcomes");
 			expect(memoryRequest?.context.systemPrompt).toContain("Do not repeat actual credential or secret values");
-			expect(memoryRequest?.context.systemPrompt).not.toContain("Personal OMP profile tool mapping");
+			expect(memoryRequest?.context.systemPrompt).not.toContain("## Axia-Pi tool usage");
 			expect(memoryRequest?.context.tools?.map((tool) => tool.name)).toEqual(["return_memory_curate"]);
 			const curatorMessage = memoryRequest?.context.messages[0];
 			if (!curatorMessage || curatorMessage.role !== "user" || typeof curatorMessage.content !== "string") {
@@ -1023,6 +1044,89 @@ describe("personal harness extension in an AgentSession", () => {
 		});
 	});
 
+	it("renders TODO text without widget padding, preserves its marker, and keeps placement", async () => {
+		type TodoWidgetFactory = (tui: TUI, theme: Theme) => Component & { dispose?(): void };
+		let extensionApi: ExtensionAPI | undefined;
+		const widgets: Array<{ factory: TodoWidgetFactory; placement?: string }> = [];
+		const setWidget = vi.fn(
+			(
+				key: string,
+				content: string[] | TodoWidgetFactory | undefined,
+				options?: { placement?: "aboveEditor" | "belowEditor" },
+			) => {
+				if (key === "personal-harness-todo" && typeof content === "function") {
+					widgets.push({ factory: content, placement: options?.placement });
+				}
+			},
+		);
+		const harness = await create(dataDirectory(), {
+			extensionFactories: [
+				(pi) => {
+					extensionApi = pi;
+				},
+			],
+		});
+		await harness.session.bindExtensions({
+			mode: "tui",
+			uiContext: { setWidget } as unknown as ExtensionUIContext,
+		});
+
+		// The factory only reads fg for its overflow marker; Text rendering does not use TUI.
+		const widgetTui = {} as TUI;
+		const widgetTheme = { fg: (_color: string, text: string) => text } as Theme;
+		const renderLatestWidget = (width: number): string[] => {
+			const widget = widgets.at(-1);
+			if (!widget) throw new Error("TODO widget factory was not registered");
+			return widget
+				.factory(widgetTui, widgetTheme)
+				.render(width)
+				.map((line) => stripAnsi(line).trimEnd());
+		};
+		expect(renderLatestWidget(80)).toEqual(["TODO / 0/0 done / 0 in progress"]);
+		expect(widgets.at(-1)?.placement).toBe("belowEditor");
+
+		if (!extensionApi) throw new Error("Extension API was not initialized");
+		const added = await extensionApi.executeTool(
+			"todo",
+			{ action: "add", title: "Keep the TODO item prefix" },
+			{ assistantMessage: fauxAssistantMessage("Add a TODO item") },
+		);
+		const addedText = added.content.find((part) => part.type === "text")?.text;
+		if (!addedText) throw new Error("TODO add returned no text result");
+		const parsedAdded: unknown = JSON.parse(addedText);
+		if (!isRecord(parsedAdded) || !Array.isArray(parsedAdded.items))
+			throw new Error("TODO add returned an invalid result");
+		const addedItems: unknown[] = parsedAdded.items;
+		const firstItem = addedItems[0];
+		if (!isRecord(firstItem) || typeof firstItem.id !== "string") throw new Error("TODO add returned no item ID");
+		const itemId = firstItem.id;
+		await extensionApi.executeTool(
+			"todo",
+			{ action: "status", id: itemId, status: "in_progress" },
+			{ assistantMessage: fauxAssistantMessage("Mark the TODO in progress") },
+		);
+
+		expect(renderLatestWidget(80)).toEqual(["TODO / 0/1 done / 1 in progress", "[>] Keep the TODO item prefix"]);
+		for (const width of [16, 40]) {
+			const lines = renderLatestWidget(width);
+			expect(lines[0]).toMatch(/^TODO/u);
+			expect(lines).not.toContain("");
+			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+
+		for (let index = 0; index < 10; index++) {
+			await extensionApi.executeTool(
+				"todo",
+				{ action: "add", title: `Additional TODO ${index + 1}` },
+				{ assistantMessage: fauxAssistantMessage("Add another TODO item") },
+			);
+		}
+		const truncatedLines = renderLatestWidget(80);
+		expect(truncatedLines).toHaveLength(11);
+		expect(truncatedLines[0]).toBe("TODO / 0/11 done / 1 in progress");
+		expect(truncatedLines.at(-1)).toBe("... (widget truncated)");
+	});
+
 	it("uses Luna high with Fast Mode and accepts a reasonable background completion", async () => {
 		const todoCalls: Parameters<typeof modelCalls.completeHarnessTask>[0][] = [];
 		vi.spyOn(modelCalls, "completeHarnessTask").mockImplementation(async (options) => {
@@ -1143,6 +1247,9 @@ describe("personal harness extension in an AgentSession", () => {
 		expect(requests[0].evalDescription).toContain('tool.tool_info({name: "NAME"})');
 		expect(requests[0].names.sort()).toEqual(["ask", "eval", "todo"]);
 		expect(requests[0].system).toContain("LEGACY_APPEND_MARKER");
+		expect(requests[0].system).toContain(
+			"- View or update session TODO items; use returned IDs and reserve retry for failed persistence.",
+		);
 		for (const prompt of legacyPromptViews) {
 			expect(prompt).not.toContain("HIDDEN_SNIPPET_SENTINEL");
 			expect(prompt).not.toContain("HIDDEN_GUIDELINE_SENTINEL");

@@ -23,8 +23,19 @@ const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
+	thresholdPercent?: number; // Optional early trigger; reserveTokens remains the context ceiling.
 	keepRecentTokens?: number; // default: 20000
 	modelOverrides?: Record<string, CompactionModelOverride>; // exact "provider/modelId" keys
+}
+
+function validateCompactionThresholdPercent(value: unknown): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 100) {
+		throw new Error(
+			`Invalid compaction.thresholdPercent setting: ${String(value)}. Expected an integer from 1 to 100.`,
+		);
+	}
+	return value;
 }
 
 export interface BranchSummarySettings {
@@ -856,6 +867,18 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getCompactionThresholdPercent(): number | undefined {
+		return validateCompactionThresholdPercent(this.settings.compaction?.thresholdPercent);
+	}
+
+	setCompactionThresholdPercent(thresholdPercent: number | undefined): void {
+		const value = validateCompactionThresholdPercent(thresholdPercent);
+		this.globalSettings.compaction ??= {};
+		this.globalSettings.compaction.thresholdPercent = value;
+		this.markModified("compaction", "thresholdPercent");
+		this.save();
+	}
+
 	private getCompactionTokenSetting(
 		field: keyof CompactionModelOverride,
 		model?: Pick<Model<string>, "provider" | "id">,
@@ -892,16 +915,19 @@ export class SettingsManager {
 		return this.getCompactionTokenSetting("keepRecentTokens", model);
 	}
 
-	/** Resolve each token setting through model override, ordinary setting, then built-in default. */
+	/** Resolve compaction settings for the requested model. */
 	getCompactionSettings(model?: Pick<Model<string>, "provider" | "id">): {
 		enabled: boolean;
 		reserveTokens: number;
 		keepRecentTokens: number;
+		thresholdPercent?: number;
 	} {
+		const thresholdPercent = this.getCompactionThresholdPercent();
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
+			...(thresholdPercent === undefined ? {} : { thresholdPercent }),
 		};
 	}
 

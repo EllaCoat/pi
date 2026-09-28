@@ -36,6 +36,7 @@ import {
 } from "../../src/personal-harness/hooks/jev-types.ts";
 import {
 	collectRead,
+	guidanceText,
 	READ_ENTRY,
 	type ReadObservationEvent,
 	rankCandidates,
@@ -252,6 +253,23 @@ describe("personal harness hooks", () => {
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
+	});
+	it("treats candidate estimates as guidance, not a cap on original-source reading", () => {
+		const text = guidanceText({
+			version: 1,
+			snapshot: "read-1",
+			createdAt: 1,
+			status: "ranked",
+			considered: 1,
+			unassessed: 0,
+			selections: [],
+			inputTokens: 0,
+			outputTokens: 0,
+			elapsedMs: 0,
+		});
+		expect(text).toContain("契約の確認に足りなければ関連範囲を広げる。");
+		expect(text).toContain("候補一覧の選定量を、必要な原文を読むための上限とは扱わない。");
+		expect(text).not.toContain("4,000");
 	});
 });
 

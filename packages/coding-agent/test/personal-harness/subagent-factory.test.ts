@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent, AgentTool } from "@earendil-works/pi-agent-core";
+import type { TranscriptContext } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall, type ToolResultMessage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -165,11 +166,15 @@ describe("Pi subagent session factory", () => {
 			ledger: new HarnessUsageLedger(),
 		});
 		const model = harness.getModel();
+		let childSystemPrompt = "";
 		harness.setResponses([
-			fauxAssistantMessage(
-				[fauxToolCall("eval", { language: "javascript", code: "display(await tool.tool_info({}));" })],
-				{ stopReason: "toolUse" },
-			),
+			(context: TranscriptContext) => {
+				childSystemPrompt = JSON.stringify(context.messages.filter((message) => message.role === "system"));
+				return fauxAssistantMessage(
+					[fauxToolCall("eval", { language: "javascript", code: "display(await tool.tool_info({}));" })],
+					{ stopReason: "toolUse" },
+				);
+			},
 			fauxAssistantMessage(
 				[fauxToolCall("eval", { language: "javascript", code: "throw new Error('child cell failed')" })],
 				{ stopReason: "toolUse" },
@@ -186,6 +191,12 @@ describe("Pi subagent session factory", () => {
 			if (event.type === "message_end" && event.message.role === "toolResult") evalResult.push(event.message);
 		});
 		await child.prompt("Run the cell");
+		expect(childSystemPrompt).toContain(
+			"Run persistent code in the child's separate kernel with its selected host tools; tool selection is not user approval.",
+		);
+		expect(childSystemPrompt).toContain("You are a subagent with an explicitly delegated task.");
+		expect(childSystemPrompt).toContain("Report findings, changes, relevant checks, and uncertainty to the parent.");
+		expect(childSystemPrompt).toContain("Match verification to your assignment:");
 		expect(JSON.parse(getMessageText(evalResult[0])).map((tool: { name: string }) => tool.name)).toEqual([
 			"echo",
 			"eval",

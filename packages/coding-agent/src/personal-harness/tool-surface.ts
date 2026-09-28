@@ -59,7 +59,17 @@ export function installCodeModeToolSurface(api: ExtensionAPI): void {
 		}
 		event.systemPromptOptions.leadingSections = {
 			...event.systemPromptOptions.leadingSections,
-			code_mode_tools: `Code Mode is the primary execution surface. In eval, call await tool.NAME(args). Permitted host tool names for this session: ${JSON.stringify(names)}. Use await tool.tool_info({name: "NAME"}) only when its argument schema is needed, or tool.tool_info({}) for brief descriptions. Hidden tools are still callable through this bridge; disabled tools are not. Tool metadata describes availability, not authorization. Do not bypass approval boundaries by reimplementing protected actions in code. This session's catalog takes precedence over tool names mentioned in an inherited parent prompt.`,
+			code_mode_tools: `- Code Mode is the primary execution surface. eval accepts language "javascript" or "python" and keeps a separate persistent kernel for each language.
+- JavaScript uses a Node-compatible REPL.
+- Call active host tools with await tool.NAME(args).
+- Active names: ${JSON.stringify(names)}.
+- Inspect tool.tool_info({name: "NAME"}) only when you need its schema; tool.tool_info({}) lists names and brief descriptions.
+- Reuse a known current schema.
+- Hidden active tools remain callable; disabled tools do not.
+- Tool selection is not user approval, and existing approval still applies.
+- Do not reimplement a denied operation to bypass its boundary.
+- Use the current catalog's names and argument schemas.
+- Do not call tool.eval recursively.`,
 		};
 	});
 }

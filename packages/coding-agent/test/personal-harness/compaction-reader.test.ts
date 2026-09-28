@@ -189,6 +189,21 @@ describe("compaction transcript reader", () => {
 		expect(rendered).toContain(argumentFixture);
 	});
 
+	it("keeps system instructions out of the transcript summary source", () => {
+		const entries = sourceEntries();
+		entries.splice(2, 0, messageEntry("system-7", "assistant-2", "system", "SYSTEM_INSTRUCTION_SENTINEL"));
+		const next = entries[3];
+		if (next?.type !== "message") throw new Error("Expected a message after the system entry");
+		entries[3] = { ...next, parentId: "system-7" };
+
+		const reader = createReader(entries);
+		expect(JSON.stringify(reader.initialContext({}))).not.toContain("SYSTEM_INSTRUCTION_SENTINEL");
+		expect(reader.search({ query: "SYSTEM_INSTRUCTION_SENTINEL" })).toMatchObject({
+			matchingRecords: 0,
+			returnedRecords: 0,
+		});
+	});
+
 	it("lists metadata, searches sanitized text, and batch-reads only the frozen target", () => {
 		const reader = createReader();
 		const listing = reader.list({ offset: 0, limit: 20 });

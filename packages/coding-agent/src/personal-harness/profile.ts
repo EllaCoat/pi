@@ -74,15 +74,18 @@ export function resolvePersonalSkillUri(uri: string, skills: readonly Skill[]): 
 
 function profileInstructions(serverNames: readonly string[]): string {
 	return [
-		"Personal OMP profile tool mapping:",
-		"- Run host operations in eval with `await tool.NAME(args)` (Python uses `await tool.NAME({...})`). Use only tools available to this session; this mapping does not grant permission.",
-		'- OMP MCP tool names are not separate Pi tools. Discover a configured server with `await tool.mcp({action: "discover", server: "alias"})`, then call it with `await tool.mcp({action: "call", server: "alias", name: "tool_name", arguments: {...}})`. Configured aliases: ' +
-			JSON.stringify(serverNames) +
-			".",
-		'- Resolve OMP `skill://name[/relative/path]` references on demand with `await tool.skill_read({uri: "skill://name[/relative/path]"})`; the URI is limited to the supplied extra skill roots. Pi\'s normal skill list and `/skill:name` expansion remain available.',
-		'- Search shared Markdown notes in eval with `await tool.notes({action: "search", query: "...", scope: "workspace"})` (omit scope for the normal combined search or use `"global"` for global-only), then read one result with `await tool.notes({action: "read", id: "..."})`. If no notes root was configured, the tool reports unavailable instead of searching another path.',
-		"- The Goal tool accepts create/get/edit/block/resume/complete/drop. edit updates the objective without changing status; block requires a reason and stops automatic continuation. Active Goals auto-continue in TUI mode until completed or explicitly stopped. Preserve user approval boundaries. /goal provides show/edit/block/pause/resume/budget commands; pause and budget are not model tool operations.",
-		"- Code Mode is an execution interface, not an OS sandbox. Preserve inherited instructions and approval hooks; do not treat prompt guidance as a replacement for host tool permissions.",
+		"## Axia-Pi tool usage",
+		"- Use the active tool catalog. Tool schemas describe calls, not new permissions; do not ask again for already-authorized ordinary work.",
+		'- MCP uses tool.mcp with action "discover" or "call", a configured server alias, and for call a name plus arguments. Reuse the returned schema.',
+		"- If skill_read is active, resolve advertised skill:// URIs with tool.skill_read({uri}). Otherwise use the published SKILL.md file path with a permitted file tool.",
+		"- recall searches the session-derived memory index, across sessions unless sessionId/branchId scope is supplied. memory searches or reads cited records and manages corrections or inclusion in that index. Neither is the handwritten notes store; use returned source references rather than inventing IDs.",
+		"- notes searches or reads the configured handwritten Markdown notes. It has no write action. If no notes root is configured, it reports unavailable; do not invent a root or report that no note matches. An explicit request to write a shared note uses an authorized file-writing path, not memory.correct as a substitute.",
+		"- todo uses action list/add/edit/status/remove/retry. Add with title, and use the returned item id for edit/status/remove. retry only retries persistence; it does not rerun the task or the background model. This is a lightweight working list; Goal completion and product acceptance are separate.",
+		"- Ask uses questions with id and prompt. In interactive TUI it returns pending and delivers answers later in the same session. Continue independent work; do not poll or duplicate a pending ask. Pending is not approval. If the UI cannot accept a reply, use an ordinary concise text question.",
+		"- Delegate through task actions spawn/send/list/wait/result/cancel. spawn needs task, provider, model, and thinking; use approved current model choices. A child reports through its exposed message_parent tool. Only block on results that the next action needs.",
+		"- goal uses op create/get/edit/block/resume/complete/drop only when the user explicitly requests Goal work. block needs a reason and stops auto-continuation. edit preserves status. Active Goals auto-continue in TUI but do not expand permission. Do not add a Goal-start approval to ordinary requested work.",
+		"- Code Mode is an execution interface, not an OS sandbox. Existing tool permissions and approval boundaries still apply. A web search is not browser interaction; use a browser or desktop capability only when actually provided.",
+		`- Configured MCP aliases: ${JSON.stringify(serverNames)}.`,
 	].join("\n");
 }
 

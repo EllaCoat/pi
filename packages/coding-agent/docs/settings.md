@@ -53,12 +53,13 @@ Available built-in tools are `read`, `bash`, `powershell`, `edit`, `write`, `gre
 |---|---|---|---|
 | `compaction.enabled` | boolean | `true` | Enable automatic compaction. |
 | `compaction.reserveTokens` | number | `16384` | Tokens reserved for the model response. |
+| `compaction.thresholdPercent` | integer (1–100) | Unset | Start automatic compaction at this share of the selected model's context window, or earlier if `reserveTokens` requires it. |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained without summarization. |
 | `compaction.modelOverrides` | object | None | Per-model token settings keyed by exact `provider/modelId`. |
 
 <a id="per-model-compaction-overrides"></a>
 
-Compaction token values must be non-negative safe integers. Each value resolves independently from the matching model override, then the ordinary compaction setting, then the built-in default. Project and user objects merge before model lookup.
+`reserveTokens` and `keepRecentTokens` must be non-negative safe integers. Each resolves independently from the matching model override, then the ordinary compaction setting, then the built-in default. `thresholdPercent`, when set, must be an integer from 1 to 100; it is shared across models rather than model-overridable. Project and user objects merge before lookup.
 
 See [Compaction Reference](compaction.md) for trigger, summarization, and validation behavior.
 

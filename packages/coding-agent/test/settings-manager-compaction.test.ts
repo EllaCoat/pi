@@ -13,6 +13,20 @@ describe("compaction model overrides", () => {
 		expect(manager.getCompactionSettings(model)).toEqual(defaults);
 	});
 
+	it("persists, restores, and clears an optional threshold percentage", async () => {
+		const manager = SettingsManager.fromStorage(new InMemorySettingsStorage());
+		manager.setCompactionThresholdPercent(75);
+		expect(manager.getCompactionSettings()).toEqual({ ...defaults, thresholdPercent: 75 });
+		await manager.flush();
+		await manager.reload();
+		expect(manager.getCompactionThresholdPercent()).toBe(75);
+
+		manager.setCompactionThresholdPercent(undefined);
+		await manager.flush();
+		await manager.reload();
+		expect(manager.getCompactionSettings()).toEqual(defaults);
+	});
+
 	it("resolves each field independently and keeps individual getters consistent", () => {
 		const manager = SettingsManager.inMemory({
 			compaction: {
@@ -164,6 +178,30 @@ describe("compaction model overrides", () => {
 			const manager = SettingsManager.inMemory();
 			manager.applyOverrides({ compaction: { [field]: value } });
 			expect(() => manager.getCompactionSettings()).toThrow(`Invalid compaction.${field} setting: ${String(value)}`);
+		});
+	});
+
+	describe("ordinary compaction.thresholdPercent", () => {
+		it.each([null, 0, -1, 1.5, 101, "80", true, {}, []])("reports invalid settings: %j", (value) => {
+			const storage = new InMemorySettingsStorage();
+			storage.withLock("global", () => JSON.stringify({ compaction: { thresholdPercent: value } }));
+			const manager = SettingsManager.fromStorage(storage);
+			expect(() => manager.getCompactionSettings()).toThrow(
+				`Invalid compaction.thresholdPercent setting: ${String(value)}. Expected an integer from 1 to 100.`,
+			);
+		});
+
+		it.each([Number.NaN, Infinity, -Infinity])("reports non-finite runtime values: %s", (value) => {
+			const manager = SettingsManager.inMemory();
+			manager.applyOverrides({ compaction: { thresholdPercent: value } });
+			expect(() => manager.getCompactionSettings()).toThrow(
+				`Invalid compaction.thresholdPercent setting: ${String(value)}. Expected an integer from 1 to 100.`,
+			);
+		});
+
+		it.each([1, 100])("accepts the boundary percentage %i", (thresholdPercent) => {
+			const manager = SettingsManager.inMemory({ compaction: { thresholdPercent } });
+			expect(manager.getCompactionThresholdPercent()).toBe(thresholdPercent);
 		});
 	});
 
